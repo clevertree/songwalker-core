@@ -56,7 +56,27 @@ cd /home/ari/dev/songwalker-vsti && git add -A && git commit -m "..." && git pus
 
 Only commit downstream repos if they have actual changes (check `git status` first).
 
-### 5. Verify GitHub Actions
+### 5. Version bump & release build
+After significant changes (bug fixes, new features, breaking changes), bump the
+patch version **before** committing and push a tag to trigger a release build:
+
+**When to bump:** Bug fixes, new features, behavioral changes, dependency updates
+that affect output. **Do not bump** for docs-only, test-only, or refactor-only changes.
+
+```bash
+# Bump patch version in Cargo.toml (e.g. 0.1.0 → 0.1.1)
+# Update songwalker-core/Cargo.toml version field
+# Update songwalker-vsti/Cargo.toml version field (keep in sync)
+
+# After all tests pass and all repos are committed+pushed:
+cd /home/ari/dev/songwalker-vsti
+git tag v<NEW_VERSION>
+git push origin v<NEW_VERSION>
+```
+
+The tag push triggers the `Build & Release` workflow in songwalker-vsti.
+
+### 6. Verify GitHub Actions
 After pushing, check that any triggered GitHub Actions workflows succeed:
 ```bash
 # Check runs for each repo that has workflows
