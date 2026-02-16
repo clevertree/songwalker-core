@@ -1,12 +1,52 @@
 //! Audio Engine — renders an EventList to audio samples.
 //!
 //! The engine manages voices, processes events at the correct sample offsets,
-//! and produces interleaved stereo f32 output.
+//! and produces interleaved stereo f32 output. Supports both oscillator
+//! synthesis and sample-based playback via the preset registry.
+
+use std::collections::HashMap;
 
 use crate::compiler::{EndMode, EventKind, EventList, InstrumentConfig};
 
 use super::mixer::Mixer;
+use super::sampler::{Sampler, SamplerVoice};
 use super::voice::Voice;
+
+/// A unified voice that can be either an oscillator or a sampler playback.
+enum ActiveVoice {
+    Oscillator(Voice),
+    Sampler(SamplerVoice),
+}
+
+impl ActiveVoice {
+    fn next_sample(&mut self) -> f64 {
+        match self {
+            ActiveVoice::Oscillator(v) => v.next_sample(),
+            ActiveVoice::Sampler(v) => v.next_sample(),
+        }
+    }
+
+    fn note_off(&mut self) {
+        match self {
+            ActiveVoice::Oscillator(v) => v.note_off(),
+            ActiveVoice::Sampler(v) => v.note_off(),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        match self {
+            ActiveVoice::Oscillator(v) => v.is_finished(),
+            ActiveVoice::Sampler(v) => v.is_finished(),
+        }
+    }
+
+    fn release_sample(&self) -> usize {
+        match self {
+            ActiveVoice::Oscillator(v) => v.release_sample,
+            ActiveVoice::Sampler(v) => v.release_sample,
+        }
+    }
+}
 
 /// Parse a note name (e.g. "C4", "F#3", "Bb5") into a MIDI note number.
 pub fn note_to_midi(note: &str) -> Option<i32> {
@@ -78,6 +118,15 @@ pub fn note_to_frequency_with_tuning(note: &str, tuning_pitch: f64) -> Option<f6
     Some(midi_to_frequency(midi, tuning_pitch))
 }
 
+/// Convert a frequency back to the nearest MIDI note number.
+///
+/// Inverse of `midi_to_frequency`. Used for zone lookup when we only have
+/// the computed frequency from a note name.
+fn note_to_midi_from_freq(freq: f64, tuning_pitch: f64) -> u8 {
+    let midi = 69.0 + 12.0 * (freq / tuning_pitch).log2();
+    midi.round().clamp(0.0, 127.0) as u8
+}
+
 /// Scheduled voice event for the engine.
 struct ScheduledNote {
     /// Sample offset when the note starts.
@@ -97,6 +146,8 @@ pub struct AudioEngine {
     /// Tuning pitch for A4 in Hz. Default is 440.0.
     pub tuning_pitch: f64,
     max_voices: usize,
+    /// Loaded sampler presets, keyed by preset name (e.g. "FluidR3_GM/Acoustic Grand Piano").
+    preset_registry: HashMap<String, Sampler>,
 }
 
 impl AudioEngine {
@@ -106,7 +157,13 @@ impl AudioEngine {
             bpm: 120.0,
             tuning_pitch: 440.0,
             max_voices: 64,
+            preset_registry: HashMap::new(),
         }
+    }
+
+    /// Register a loaded sampler preset for use during rendering.
+    pub fn register_preset(&mut self, name: String, sampler: Sampler) {
+        self.preset_registry.insert(name, sampler);
     }
 
     /// Render an entire EventList to mono f64 samples.
@@ -206,7 +263,7 @@ impl AudioEngine {
         // Render in blocks
         let block_size = 128;
         let mut mixer = Mixer::new();
-        let mut voices: Vec<Voice> = Vec::new();
+        let mut voices: Vec<ActiveVoice> = Vec::new();
         let mut output = vec![0.0_f64; total_samples];
         let mut next_note_idx = 0;
 
@@ -221,9 +278,42 @@ impl AudioEngine {
             {
                 let note = &scheduled[next_note_idx];
                 if voices.len() < self.max_voices {
-                    let mut voice = Voice::with_config(self.sample_rate, &note.instrument);
-                    voice.release_sample = note.release_sample;
-                    voice.note_on(note.frequency, note.velocity);
+                    // Check if this note references a sampler preset
+                    let voice = if let Some(ref preset_name) = note.instrument.preset_ref {
+                        if let Some(sampler) = self.preset_registry.get(preset_name) {
+                            // Use sampler voice
+                            let midi_note = note_to_midi_from_freq(note.frequency, tuning_pitch);
+                            if let Some(zone) = sampler.find_zone(midi_note) {
+                                let mut sv = SamplerVoice::new(
+                                    zone,
+                                    midi_note,
+                                    note.velocity,
+                                    tuning_pitch,
+                                    self.sample_rate,
+                                );
+                                sv.release_sample = note.release_sample;
+                                ActiveVoice::Sampler(sv)
+                            } else {
+                                // No matching zone — fall back to oscillator
+                                let mut v = Voice::with_config(self.sample_rate, &note.instrument);
+                                v.release_sample = note.release_sample;
+                                v.note_on(note.frequency, note.velocity);
+                                ActiveVoice::Oscillator(v)
+                            }
+                        } else {
+                            // Preset not in registry — fall back to oscillator
+                            let mut v = Voice::with_config(self.sample_rate, &note.instrument);
+                            v.release_sample = note.release_sample;
+                            v.note_on(note.frequency, note.velocity);
+                            ActiveVoice::Oscillator(v)
+                        }
+                    } else {
+                        // No preset ref — standard oscillator voice
+                        let mut v = Voice::with_config(self.sample_rate, &note.instrument);
+                        v.release_sample = note.release_sample;
+                        v.note_on(note.frequency, note.velocity);
+                        ActiveVoice::Oscillator(v)
+                    };
                     voices.push(voice);
                 }
                 next_note_idx += 1;
@@ -231,7 +321,7 @@ impl AudioEngine {
 
             // Check for note releases — each voice carries its own release_sample
             for voice in voices.iter_mut() {
-                if voice.release_sample >= block_start && voice.release_sample < block_end {
+                if voice.release_sample() >= block_start && voice.release_sample() < block_end {
                     voice.note_off();
                 }
             }
@@ -590,6 +680,108 @@ mod tests {
         assert!(
             tail_max < 0.001,
             "Audio should be silent after note gate + release, max={tail_max}"
+        );
+    }
+
+    #[test]
+    fn render_with_sampler_preset() {
+        // Verify the engine uses SamplerVoice when a preset is registered
+        use crate::dsp::sampler::{LoadedZone, Sampler, SampleBuffer};
+
+        let sample_rate = 44100;
+        let mut engine = AudioEngine::new(sample_rate as f64);
+
+        // Create a simple sine wave sample at A4 (MIDI 69)
+        let freq = 440.0;
+        let num_samples = sample_rate; // 1 second
+        let data: Vec<f64> = (0..num_samples)
+            .map(|i| {
+                let t = i as f64 / sample_rate as f64;
+                (2.0 * std::f64::consts::PI * freq * t).sin()
+            })
+            .collect();
+        let buffer = SampleBuffer::new(data, sample_rate as u32);
+
+        let zone = LoadedZone {
+            key_range_low: 0,
+            key_range_high: 127,
+            root_note: 69, // A4
+            fine_tune_cents: 0.0,
+            sample_rate: sample_rate as u32,
+            loop_start: None,
+            loop_end: None,
+            buffer,
+        };
+
+        let sampler = Sampler::new(vec![zone], false);
+        engine.register_preset("TestPreset/Piano".to_string(), sampler);
+
+        let song = EventList {
+            events: vec![
+                Event {
+                    time: 0.0,
+                    kind: EventKind::SetProperty {
+                        target: "track.beatsPerMinute".to_string(),
+                        value: "120".to_string(),
+                    },
+                },
+                Event {
+                    time: 0.0,
+                    kind: EventKind::Note {
+                        pitch: "A4".to_string(),
+                        velocity: 100.0,
+                        gate: 1.0,
+                        instrument: InstrumentConfig {
+                            preset_ref: Some("TestPreset/Piano".to_string()),
+                            ..Default::default()
+                        },
+                        source_start: 0,
+                        source_end: 0,
+                    },
+                },
+            ],
+            total_beats: 1.0,
+            end_mode: EndMode::Gate,
+        };
+
+        let audio = engine.render(&song);
+        // Should have non-zero output — sampler voice is playing the sine sample
+        let max = audio.iter().fold(0.0_f64, |m, &s| m.max(s.abs()));
+        assert!(
+            max > 0.01,
+            "Sampler-rendered audio should be non-silent, max={max}"
+        );
+    }
+
+    #[test]
+    fn render_sampler_fallback_on_missing_preset() {
+        // When preset_ref is set but not registered, should fall back to oscillator
+        let engine = AudioEngine::new(44100.0);
+        let song = EventList {
+            events: vec![Event {
+                time: 0.0,
+                kind: EventKind::Note {
+                    pitch: "C4".to_string(),
+                    velocity: 100.0,
+                    gate: 1.0,
+                    instrument: InstrumentConfig {
+                        preset_ref: Some("Missing/Preset".to_string()),
+                        ..Default::default()
+                    },
+                    source_start: 0,
+                    source_end: 0,
+                },
+            }],
+            total_beats: 1.0,
+            end_mode: EndMode::Gate,
+        };
+
+        let audio = engine.render(&song);
+        // Should still produce sound (oscillator fallback)
+        let max = audio.iter().fold(0.0_f64, |m, &s| m.max(s.abs()));
+        assert!(
+            max > 0.01,
+            "Fallback oscillator should produce sound, max={max}"
         );
     }
 }

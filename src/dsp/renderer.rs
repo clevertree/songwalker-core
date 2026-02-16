@@ -11,6 +11,11 @@ pub fn render_wav(event_list: &EventList, sample_rate: u32) -> Vec<u8> {
     encode_wav(&pcm, sample_rate, 2)
 }
 
+/// Public wrapper for WAV encoding — used by lib.rs for preset-aware rendering.
+pub fn encode_wav_public(samples: &[i16], sample_rate: u32, channels: u16) -> Vec<u8> {
+    encode_wav(samples, sample_rate, channels)
+}
+
 /// Encode interleaved i16 PCM samples to a WAV byte buffer.
 fn encode_wav(samples: &[i16], sample_rate: u32, channels: u16) -> Vec<u8> {
     let bits_per_sample: u16 = 16;
