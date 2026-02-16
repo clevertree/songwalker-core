@@ -5,7 +5,9 @@
 //! - **Split**: Route notes to children by MIDI key range
 //! - **Chain**: Audio passes through children in series (for effects)
 
-use super::sampler::{SamplerVoice, LoadedZone, Sampler};
+use super::sampler::{SamplerVoice, Sampler};
+use super::voice::Voice;
+use crate::compiler::InstrumentConfig;
 
 /// Mode of combination for composite children.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,9 +36,10 @@ pub struct CompositeInstrument {
 pub enum CompositeChild {
     /// A sampler with zones.
     Sampler(Sampler),
+    /// An oscillator with configuration.
+    Oscillator(InstrumentConfig),
     /// A nested composite.
     Composite(Box<CompositeInstrument>),
-    // Future: Oscillator, Effect nodes
 }
 
 impl CompositeInstrument {
@@ -122,6 +125,11 @@ impl CompositeInstrument {
     }
 }
 
+/// Convert MIDI note to frequency using the tuning pitch.
+fn midi_to_freq(midi_note: u8, tuning_pitch: f64) -> f64 {
+    tuning_pitch * (2.0_f64).powf((midi_note as f64 - 69.0) / 12.0)
+}
+
 fn trigger_child(
     child: &CompositeChild,
     midi_note: u8,
@@ -138,6 +146,12 @@ fn trigger_child(
                 Vec::new()
             }
         }
+        CompositeChild::Oscillator(config) => {
+            let mut voice = Voice::with_config(engine_sample_rate, config);
+            let freq = midi_to_freq(midi_note, tuning_pitch);
+            voice.note_on(freq, velocity);
+            vec![CompositeVoice::Oscillator(voice)]
+        }
         CompositeChild::Composite(composite) => {
             composite.trigger_note(midi_note, velocity, tuning_pitch, engine_sample_rate)
         }
@@ -148,25 +162,28 @@ fn trigger_child(
 #[derive(Debug, Clone)]
 pub enum CompositeVoice {
     Sampler(SamplerVoice),
-    // Future: Oscillator, Effect voices
+    Oscillator(Voice),
 }
 
 impl CompositeVoice {
     pub fn next_sample(&mut self) -> f64 {
         match self {
             CompositeVoice::Sampler(v) => v.next_sample(),
+            CompositeVoice::Oscillator(v) => v.next_sample(),
         }
     }
 
     pub fn note_off(&mut self) {
         match self {
             CompositeVoice::Sampler(v) => v.note_off(),
+            CompositeVoice::Oscillator(v) => v.note_off(),
         }
     }
 
     pub fn is_finished(&self) -> bool {
         match self {
             CompositeVoice::Sampler(v) => v.is_finished(),
+            CompositeVoice::Oscillator(v) => v.is_finished(),
         }
     }
 }

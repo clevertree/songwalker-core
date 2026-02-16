@@ -1,21 +1,32 @@
 //! Audio Engine — renders an EventList to audio samples.
 //!
 //! The engine manages voices, processes events at the correct sample offsets,
-//! and produces interleaved stereo f32 output. Supports both oscillator
-//! synthesis and sample-based playback via the preset registry.
+//! and produces interleaved stereo f32 output. Supports oscillator synthesis,
+//! sample-based playback, and composite instruments via the preset registry.
 
 use std::collections::HashMap;
 
 use crate::compiler::{EndMode, EventKind, EventList, InstrumentConfig};
 
+use super::composite::{CompositeInstrument, CompositeVoice};
 use super::mixer::Mixer;
 use super::sampler::{Sampler, SamplerVoice};
 use super::voice::Voice;
 
-/// A unified voice that can be either an oscillator or a sampler playback.
+/// A registered preset — either a sampler or a composite instrument.
+#[derive(Debug, Clone)]
+pub enum RegisteredPreset {
+    Sampler(Sampler),
+    Composite(CompositeInstrument),
+}
+
+/// A unified voice that can be an oscillator, sampler, or composite.
 enum ActiveVoice {
     Oscillator(Voice),
     Sampler(SamplerVoice),
+    /// Composite voice: multiple sub-voices that play together.
+    /// The usize is the release_sample for the composite group.
+    Composite(Vec<CompositeVoice>, usize),
 }
 
 impl ActiveVoice {
@@ -23,6 +34,18 @@ impl ActiveVoice {
         match self {
             ActiveVoice::Oscillator(v) => v.next_sample(),
             ActiveVoice::Sampler(v) => v.next_sample(),
+            ActiveVoice::Composite(voices, _) => {
+                let mut sum = 0.0;
+                for v in voices.iter_mut() {
+                    sum += v.next_sample();
+                }
+                // Normalize by number of voices to prevent clipping
+                if voices.len() > 1 {
+                    sum / voices.len() as f64
+                } else {
+                    sum
+                }
+            }
         }
     }
 
@@ -30,6 +53,11 @@ impl ActiveVoice {
         match self {
             ActiveVoice::Oscillator(v) => v.note_off(),
             ActiveVoice::Sampler(v) => v.note_off(),
+            ActiveVoice::Composite(voices, _) => {
+                for v in voices.iter_mut() {
+                    v.note_off();
+                }
+            }
         }
     }
 
@@ -37,6 +65,7 @@ impl ActiveVoice {
         match self {
             ActiveVoice::Oscillator(v) => v.is_finished(),
             ActiveVoice::Sampler(v) => v.is_finished(),
+            ActiveVoice::Composite(voices, _) => voices.iter().all(|v| v.is_finished()),
         }
     }
 
@@ -44,6 +73,7 @@ impl ActiveVoice {
         match self {
             ActiveVoice::Oscillator(v) => v.release_sample,
             ActiveVoice::Sampler(v) => v.release_sample,
+            ActiveVoice::Composite(_, rs) => *rs,
         }
     }
 }
@@ -146,8 +176,8 @@ pub struct AudioEngine {
     /// Tuning pitch for A4 in Hz. Default is 440.0.
     pub tuning_pitch: f64,
     max_voices: usize,
-    /// Loaded sampler presets, keyed by preset name (e.g. "FluidR3_GM/Acoustic Grand Piano").
-    preset_registry: HashMap<String, Sampler>,
+    /// Registered presets, keyed by preset name (e.g. "FluidR3_GM/Acoustic Grand Piano").
+    preset_registry: HashMap<String, RegisteredPreset>,
 }
 
 impl AudioEngine {
@@ -163,7 +193,12 @@ impl AudioEngine {
 
     /// Register a loaded sampler preset for use during rendering.
     pub fn register_preset(&mut self, name: String, sampler: Sampler) {
-        self.preset_registry.insert(name, sampler);
+        self.preset_registry.insert(name, RegisteredPreset::Sampler(sampler));
+    }
+
+    /// Register a composite instrument preset for use during rendering.
+    pub fn register_composite(&mut self, name: String, composite: CompositeInstrument) {
+        self.preset_registry.insert(name, RegisteredPreset::Composite(composite));
     }
 
     /// Render an entire EventList to mono f64 samples.
@@ -278,27 +313,49 @@ impl AudioEngine {
             {
                 let note = &scheduled[next_note_idx];
                 if voices.len() < self.max_voices {
-                    // Check if this note references a sampler preset
+                    // Check if this note references a preset
                     let voice = if let Some(ref preset_name) = note.instrument.preset_ref {
-                        if let Some(sampler) = self.preset_registry.get(preset_name) {
-                            // Use sampler voice
+                        if let Some(preset) = self.preset_registry.get(preset_name) {
                             let midi_note = note_to_midi_from_freq(note.frequency, tuning_pitch);
-                            if let Some(zone) = sampler.find_zone(midi_note) {
-                                let mut sv = SamplerVoice::new(
-                                    zone,
-                                    midi_note,
-                                    note.velocity,
-                                    tuning_pitch,
-                                    self.sample_rate,
-                                );
-                                sv.release_sample = note.release_sample;
-                                ActiveVoice::Sampler(sv)
-                            } else {
-                                // No matching zone — fall back to oscillator
-                                let mut v = Voice::with_config(self.sample_rate, &note.instrument);
-                                v.release_sample = note.release_sample;
-                                v.note_on(note.frequency, note.velocity);
-                                ActiveVoice::Oscillator(v)
+                            match preset {
+                                RegisteredPreset::Sampler(sampler) => {
+                                    // Use sampler voice
+                                    if let Some(zone) = sampler.find_zone(midi_note) {
+                                        let mut sv = SamplerVoice::new(
+                                            zone,
+                                            midi_note,
+                                            note.velocity,
+                                            tuning_pitch,
+                                            self.sample_rate,
+                                        );
+                                        sv.release_sample = note.release_sample;
+                                        ActiveVoice::Sampler(sv)
+                                    } else {
+                                        // No matching zone — fall back to oscillator
+                                        let mut v = Voice::with_config(self.sample_rate, &note.instrument);
+                                        v.release_sample = note.release_sample;
+                                        v.note_on(note.frequency, note.velocity);
+                                        ActiveVoice::Oscillator(v)
+                                    }
+                                }
+                                RegisteredPreset::Composite(composite) => {
+                                    // Use composite voice(s)
+                                    let sub_voices = composite.trigger_note(
+                                        midi_note,
+                                        note.velocity,
+                                        tuning_pitch,
+                                        self.sample_rate,
+                                    );
+                                    if sub_voices.is_empty() {
+                                        // No voices triggered — fall back to oscillator
+                                        let mut v = Voice::with_config(self.sample_rate, &note.instrument);
+                                        v.release_sample = note.release_sample;
+                                        v.note_on(note.frequency, note.velocity);
+                                        ActiveVoice::Oscillator(v)
+                                    } else {
+                                        ActiveVoice::Composite(sub_voices, note.release_sample)
+                                    }
+                                }
                             }
                         } else {
                             // Preset not in registry — fall back to oscillator
@@ -782,6 +839,201 @@ mod tests {
         assert!(
             max > 0.01,
             "Fallback oscillator should produce sound, max={max}"
+        );
+    }
+
+    #[test]
+    fn render_with_composite_layer_preset() {
+        // Verify the engine uses CompositeVoice for layer mode presets
+        use crate::dsp::sampler::{LoadedZone, Sampler, SampleBuffer};
+        use crate::dsp::composite::{CompositeInstrument, CompositeChild};
+
+        let sample_rate = 44100;
+        let mut engine = AudioEngine::new(sample_rate as f64);
+
+        // Create two samplers with sine wave samples
+        let make_sampler = || {
+            let freq = 440.0;
+            let num_samples = sample_rate;
+            let data: Vec<f64> = (0..num_samples)
+                .map(|i| {
+                    let t = i as f64 / sample_rate as f64;
+                    (2.0 * std::f64::consts::PI * freq * t).sin()
+                })
+                .collect();
+            let buffer = SampleBuffer::new(data, sample_rate as u32);
+            let zone = LoadedZone {
+                key_range_low: 0,
+                key_range_high: 127,
+                root_note: 69,
+                fine_tune_cents: 0.0,
+                sample_rate: sample_rate as u32,
+                loop_start: None,
+                loop_end: None,
+                buffer,
+            };
+            Sampler::new(vec![zone], false)
+        };
+
+        let composite = CompositeInstrument::new_layer(
+            vec![
+                CompositeChild::Sampler(make_sampler()),
+                CompositeChild::Sampler(make_sampler()),
+            ],
+            Some(vec![0.7, 0.3]),
+        );
+        engine.register_composite("TestComposite/Layered".to_string(), composite);
+
+        let song = EventList {
+            events: vec![Event {
+                time: 0.0,
+                kind: EventKind::Note {
+                    pitch: "A4".to_string(),
+                    velocity: 100.0,
+                    gate: 0.5,
+                    instrument: InstrumentConfig {
+                        preset_ref: Some("TestComposite/Layered".to_string()),
+                        ..Default::default()
+                    },
+                    source_start: 0,
+                    source_end: 0,
+                },
+            }],
+            total_beats: 1.0,
+            end_mode: EndMode::Gate,
+        };
+
+        let audio = engine.render(&song);
+        let max = audio.iter().fold(0.0_f64, |m, &s| m.max(s.abs()));
+        assert!(
+            max > 0.01,
+            "Composite layered preset should produce sound, max={max}"
+        );
+    }
+
+    #[test]
+    fn render_with_composite_oscillator_layer() {
+        // Verify composite can layer oscillators
+        use crate::dsp::composite::{CompositeInstrument, CompositeChild};
+
+        let sample_rate = 44100;
+        let mut engine = AudioEngine::new(sample_rate as f64);
+
+        // Create a composite with two oscillators
+        let osc1 = InstrumentConfig {
+            waveform: "sine".to_string(),
+            mixer: Some(0.5),
+            ..Default::default()
+        };
+        let osc2 = InstrumentConfig {
+            waveform: "triangle".to_string(),
+            mixer: Some(0.5),
+            ..Default::default()
+        };
+
+        let composite = CompositeInstrument::new_layer(
+            vec![
+                CompositeChild::Oscillator(osc1),
+                CompositeChild::Oscillator(osc2),
+            ],
+            None,
+        );
+        engine.register_composite("TestComposite/OscLayer".to_string(), composite);
+
+        let song = EventList {
+            events: vec![Event {
+                time: 0.0,
+                kind: EventKind::Note {
+                    pitch: "C4".to_string(),
+                    velocity: 100.0,
+                    gate: 0.5,
+                    instrument: InstrumentConfig {
+                        preset_ref: Some("TestComposite/OscLayer".to_string()),
+                        ..Default::default()
+                    },
+                    source_start: 0,
+                    source_end: 0,
+                },
+            }],
+            total_beats: 1.0,
+            end_mode: EndMode::Gate,
+        };
+
+        let audio = engine.render(&song);
+        let max = audio.iter().fold(0.0_f64, |m, &s| m.max(s.abs()));
+        assert!(
+            max > 0.01,
+            "Composite oscillator layer should produce sound, max={max}"
+        );
+    }
+
+    #[test]
+    fn render_with_composite_split_mode() {
+        // Verify composite split mode routes notes to correct children
+        use crate::dsp::sampler::{LoadedZone, Sampler, SampleBuffer};
+        use crate::dsp::composite::{CompositeInstrument, CompositeChild};
+
+        let sample_rate = 44100;
+        let mut engine = AudioEngine::new(sample_rate as f64);
+
+        // Low zone: MIDI 0-60, High zone: MIDI 61-127
+        let make_sampler_for_range = |low: u8, high: u8, root: u8| {
+            let freq = 440.0;
+            let num_samples = sample_rate / 2;
+            let data: Vec<f64> = (0..num_samples)
+                .map(|i| {
+                    let t = i as f64 / sample_rate as f64;
+                    (2.0 * std::f64::consts::PI * freq * t).sin()
+                })
+                .collect();
+            let buffer = SampleBuffer::new(data, sample_rate as u32);
+            let zone = LoadedZone {
+                key_range_low: low,
+                key_range_high: high,
+                root_note: root,
+                fine_tune_cents: 0.0,
+                sample_rate: sample_rate as u32,
+                loop_start: None,
+                loop_end: None,
+                buffer,
+            };
+            Sampler::new(vec![zone], false)
+        };
+
+        let composite = CompositeInstrument::new_split(
+            vec![
+                CompositeChild::Sampler(make_sampler_for_range(0, 60, 48)),
+                CompositeChild::Sampler(make_sampler_for_range(61, 127, 72)),
+            ],
+            None,
+        );
+        engine.register_composite("TestComposite/Split".to_string(), composite);
+
+        // Play a low note (C4 = MIDI 60)
+        let song = EventList {
+            events: vec![Event {
+                time: 0.0,
+                kind: EventKind::Note {
+                    pitch: "C4".to_string(),
+                    velocity: 100.0,
+                    gate: 0.5,
+                    instrument: InstrumentConfig {
+                        preset_ref: Some("TestComposite/Split".to_string()),
+                        ..Default::default()
+                    },
+                    source_start: 0,
+                    source_end: 0,
+                },
+            }],
+            total_beats: 1.0,
+            end_mode: EndMode::Gate,
+        };
+
+        let audio = engine.render(&song);
+        let max = audio.iter().fold(0.0_f64, |m, &s| m.max(s.abs()));
+        assert!(
+            max > 0.01,
+            "Composite split mode should produce sound for C4, max={max}"
         );
     }
 }

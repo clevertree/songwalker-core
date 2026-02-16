@@ -60,7 +60,7 @@ pub fn render_song_samples(source: &str, sample_rate: u32) -> Result<Vec<f32>, J
 }
 
 /// A loaded preset zone transferred from JS → WASM.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 struct WasmLoadedZone {
     #[serde(rename = "keyRangeLow")]
     key_range_low: u8,
@@ -80,21 +80,59 @@ struct WasmLoadedZone {
     samples: Vec<f32>,
 }
 
+/// A child node in a composite preset.
+#[derive(serde::Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum WasmLoadedChild {
+    Sampler {
+        zones: Vec<WasmLoadedZone>,
+        #[serde(default, rename = "isDrumKit")]
+        is_drum_kit: bool,
+    },
+    Oscillator {
+        waveform: String,
+        #[serde(default)]
+        mixer: Option<f64>,
+        #[serde(default)]
+        attack: Option<f64>,
+        #[serde(default)]
+        decay: Option<f64>,
+        #[serde(default)]
+        sustain: Option<f64>,
+        #[serde(default)]
+        release: Option<f64>,
+    },
+}
+
 /// A loaded preset transferred from JS → WASM.
+/// Can be a simple sampler or a composite with multiple children.
 #[derive(serde::Deserialize)]
 struct WasmLoadedPreset {
     /// The preset name as it appears in loadPreset("name").
     name: String,
-    /// Whether this is a drum kit (percussion mode).
+    /// Preset type: "sampler" or "composite"
+    #[serde(default, rename = "presetType")]
+    preset_type: Option<String>,
+    /// Whether this is a drum kit (percussion mode) — for simple samplers.
     #[serde(default, rename = "isDrumKit")]
     is_drum_kit: bool,
-    /// Loaded sample zones with PCM data.
+    /// Loaded sample zones with PCM data — for simple samplers.
+    #[serde(default)]
     zones: Vec<WasmLoadedZone>,
+    /// Composite mode: "layer", "split", or "chain"
+    #[serde(default)]
+    mode: Option<String>,
+    /// Children for composite presets.
+    #[serde(default)]
+    children: Vec<WasmLoadedChild>,
+    /// Mix levels for layer mode.
+    #[serde(default, rename = "mixLevels")]
+    mix_levels: Option<Vec<f64>>,
 }
 
-/// Build a `Sampler` from the WASM-transferred preset data.
-fn build_sampler(preset: &WasmLoadedPreset) -> dsp::sampler::Sampler {
-    let zones = preset.zones.iter().map(|z| {
+/// Build a sampler from zones.
+fn build_sampler_from_zones(zones: &[WasmLoadedZone], is_drum_kit: bool) -> dsp::sampler::Sampler {
+    let loaded_zones = zones.iter().map(|z| {
         let buffer = dsp::sampler::SampleBuffer::from_f32(&z.samples, z.sample_rate);
         dsp::sampler::LoadedZone {
             key_range_low: z.key_range_low,
@@ -107,7 +145,66 @@ fn build_sampler(preset: &WasmLoadedPreset) -> dsp::sampler::Sampler {
             buffer,
         }
     }).collect();
-    dsp::sampler::Sampler::new(zones, preset.is_drum_kit)
+    dsp::sampler::Sampler::new(loaded_zones, is_drum_kit)
+}
+
+/// Build a composite child from the WASM data.
+fn build_composite_child(child: &WasmLoadedChild) -> dsp::composite::CompositeChild {
+    match child {
+        WasmLoadedChild::Sampler { zones, is_drum_kit } => {
+            dsp::composite::CompositeChild::Sampler(
+                build_sampler_from_zones(zones, *is_drum_kit)
+            )
+        }
+        WasmLoadedChild::Oscillator { waveform, mixer, attack, decay, sustain, release } => {
+            dsp::composite::CompositeChild::Oscillator(compiler::InstrumentConfig {
+                waveform: waveform.clone(),
+                mixer: *mixer,
+                attack: *attack,
+                decay: *decay,
+                sustain: *sustain,
+                release: *release,
+                ..Default::default()
+            })
+        }
+    }
+}
+
+/// Build a preset (sampler or composite) from the WASM-transferred data.
+fn build_preset(preset: &WasmLoadedPreset) -> dsp::engine::RegisteredPreset {
+    // Check if this is a composite preset
+    let is_composite = preset.preset_type.as_deref() == Some("composite") 
+        || !preset.children.is_empty();
+
+    if is_composite {
+        let children: Vec<dsp::composite::CompositeChild> = preset.children
+            .iter()
+            .map(build_composite_child)
+            .collect();
+
+        let mode = match preset.mode.as_deref() {
+            Some("split") => dsp::composite::CompositeMode::Split,
+            Some("chain") => dsp::composite::CompositeMode::Chain,
+            _ => dsp::composite::CompositeMode::Layer,
+        };
+
+        let composite = match mode {
+            dsp::composite::CompositeMode::Layer => 
+                dsp::composite::CompositeInstrument::new_layer(children, preset.mix_levels.clone()),
+            dsp::composite::CompositeMode::Split => 
+                dsp::composite::CompositeInstrument::new_split(children, None),
+            dsp::composite::CompositeMode::Chain => {
+                // Chain mode uses layer structure for now (effects not fully impl)
+                dsp::composite::CompositeInstrument::new_layer(children, None)
+            }
+        };
+
+        dsp::engine::RegisteredPreset::Composite(composite)
+    } else {
+        // Simple sampler preset
+        let sampler = build_sampler_from_zones(&preset.zones, preset.is_drum_kit);
+        dsp::engine::RegisteredPreset::Sampler(sampler)
+    }
 }
 
 /// WASM-exposed: compile and render `.sw` source to mono f32 samples
@@ -127,12 +224,17 @@ pub fn render_song_samples_with_presets(
 
     let mut engine = dsp::engine::AudioEngine::new(sample_rate as f64);
 
-    // Deserialize and register presets
+    // Deserialize and register presets (sampler or composite)
     let presets: Vec<WasmLoadedPreset> = serde_json::from_str(presets_json)
         .map_err(|e| JsValue::from_str(&format!("Failed to parse presets JSON: {e}")))?;
     for preset in &presets {
-        let sampler = build_sampler(preset);
-        engine.register_preset(preset.name.clone(), sampler);
+        let registered = build_preset(preset);
+        match registered {
+            dsp::engine::RegisteredPreset::Sampler(s) => 
+                engine.register_preset(preset.name.clone(), s),
+            dsp::engine::RegisteredPreset::Composite(c) => 
+                engine.register_composite(preset.name.clone(), c),
+        }
     }
 
     let samples_f64 = engine.render(&event_list);
@@ -153,11 +255,17 @@ pub fn render_song_wav_with_presets(
 
     let mut engine = dsp::engine::AudioEngine::new(sample_rate as f64);
 
+    // Deserialize and register presets (sampler or composite)
     let presets: Vec<WasmLoadedPreset> = serde_json::from_str(presets_json)
         .map_err(|e| JsValue::from_str(&format!("Failed to parse presets JSON: {e}")))?;
     for preset in &presets {
-        let sampler = build_sampler(preset);
-        engine.register_preset(preset.name.clone(), sampler);
+        let registered = build_preset(preset);
+        match registered {
+            dsp::engine::RegisteredPreset::Sampler(s) => 
+                engine.register_preset(preset.name.clone(), s),
+            dsp::engine::RegisteredPreset::Composite(c) => 
+                engine.register_composite(preset.name.clone(), c),
+        }
     }
 
     let pcm = engine.render_pcm_i16(&event_list);
