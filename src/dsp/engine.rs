@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use crate::compiler::{EndMode, EventKind, EventList, InstrumentConfig};
 
 use super::composite::{CompositeInstrument, CompositeVoice};
+use super::delay::Delay;
 use super::mixer::Mixer;
+use super::reverb::Reverb;
 use super::sampler::{Sampler, SamplerVoice};
 use super::voice::Voice;
 
@@ -167,6 +169,66 @@ struct ScheduledNote {
     velocity: f64,
     /// Instrument configuration for this note.
     instrument: InstrumentConfig,
+}
+
+/// Configuration for master effects applied to the final mix.
+#[derive(Debug, Clone)]
+pub struct MasterEffects {
+    /// Delay effect configuration.
+    pub delay: Option<DelayConfig>,
+    /// Reverb effect configuration.
+    pub reverb: Option<ReverbConfig>,
+}
+
+/// Configuration for the delay effect.
+#[derive(Debug, Clone, Copy)]
+pub struct DelayConfig {
+    /// Delay time in seconds.
+    pub time: f64,
+    /// Feedback amount (0.0 to 1.0).
+    pub feedback: f64,
+    /// Dry/wet mix (0.0 to 1.0).
+    pub mix: f64,
+}
+
+impl Default for DelayConfig {
+    fn default() -> Self {
+        Self {
+            time: 0.25,
+            feedback: 0.3,
+            mix: 0.3,
+        }
+    }
+}
+
+/// Configuration for the reverb effect.
+#[derive(Debug, Clone, Copy)]
+pub struct ReverbConfig {
+    /// Room size (0.0 to 1.0).
+    pub room_size: f64,
+    /// Damping (0.0 to 1.0).
+    pub damping: f64,
+    /// Dry/wet mix (0.0 to 1.0).
+    pub mix: f64,
+}
+
+impl Default for ReverbConfig {
+    fn default() -> Self {
+        Self {
+            room_size: 0.5,
+            damping: 0.5,
+            mix: 0.2,
+        }
+    }
+}
+
+impl Default for MasterEffects {
+    fn default() -> Self {
+        Self {
+            delay: None,
+            reverb: None,
+        }
+    }
 }
 
 /// The audio rendering engine.
@@ -409,6 +471,45 @@ impl AudioEngine {
         output
     }
 
+    /// Render to stereo f32 samples with optional master effects.
+    ///
+    /// Returns (left_channel, right_channel) as separate vectors.
+    pub fn render_stereo(&self, event_list: &EventList, effects: Option<&MasterEffects>) -> (Vec<f32>, Vec<f32>) {
+        let mono = self.render(event_list);
+
+        // Convert mono to stereo f32
+        let mut left: Vec<f32> = mono.iter().map(|&s| s as f32).collect();
+        let mut right = left.clone();
+
+        // Apply effects if configured
+        if let Some(fx) = effects {
+            // Apply delay first
+            if let Some(delay_cfg) = &fx.delay {
+                let mut delay = Delay::with_params(
+                    self.sample_rate,
+                    2.0, // max 2 seconds delay
+                    delay_cfg.time,
+                    delay_cfg.feedback,
+                    delay_cfg.mix,
+                );
+                delay.process_block(&mut left, &mut right);
+            }
+
+            // Apply reverb after delay
+            if let Some(reverb_cfg) = &fx.reverb {
+                let mut reverb = Reverb::with_params(
+                    self.sample_rate,
+                    reverb_cfg.room_size,
+                    reverb_cfg.damping,
+                    reverb_cfg.mix,
+                );
+                reverb.process_block(&mut left, &mut right);
+            }
+        }
+
+        (left, right)
+    }
+
     /// Render to interleaved stereo i16 PCM (for WAV export).
     pub fn render_pcm_i16(&self, event_list: &EventList) -> Vec<i16> {
         let mono = self.render(event_list);
@@ -417,6 +518,19 @@ impl AudioEngine {
             let sample = (s * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
             stereo.push(sample); // L
             stereo.push(sample); // R
+        }
+        stereo
+    }
+
+    /// Render to interleaved stereo i16 PCM with effects (for WAV export).
+    pub fn render_pcm_i16_with_effects(&self, event_list: &EventList, effects: &MasterEffects) -> Vec<i16> {
+        let (left, right) = self.render_stereo(event_list, Some(effects));
+        let mut stereo = Vec::with_capacity(left.len() * 2);
+        for i in 0..left.len() {
+            let l = (left[i] as f64 * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
+            let r = (right[i] as f64 * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
+            stereo.push(l);
+            stereo.push(r);
         }
         stereo
     }
@@ -1035,5 +1149,90 @@ mod tests {
             max > 0.01,
             "Composite split mode should produce sound for C4, max={max}"
         );
+    }
+
+    #[test]
+    fn render_stereo_without_effects() {
+        let engine = AudioEngine::new(44100.0);
+        let song = make_simple_song();
+
+        let (left, right) = engine.render_stereo(&song, None);
+
+        assert!(!left.is_empty());
+        assert_eq!(left.len(), right.len());
+
+        // Without effects, left and right should be identical (mono-to-stereo)
+        for i in 0..left.len() {
+            assert!((left[i] - right[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn render_stereo_with_delay() {
+        let engine = AudioEngine::new(44100.0);
+        let song = make_simple_song();
+
+        let effects = MasterEffects {
+            delay: Some(DelayConfig {
+                time: 0.1,
+                feedback: 0.3,
+                mix: 0.5,
+            }),
+            reverb: None,
+        };
+
+        let (left, right) = engine.render_stereo(&song, Some(&effects));
+
+        assert!(!left.is_empty());
+        assert_eq!(left.len(), right.len());
+
+        // Should still produce audio
+        let max_l = left.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+        assert!(max_l > 0.001, "Should produce audio with delay");
+    }
+
+    #[test]
+    fn render_stereo_with_reverb() {
+        let engine = AudioEngine::new(44100.0);
+        let song = make_simple_song();
+
+        let effects = MasterEffects {
+            delay: None,
+            reverb: Some(ReverbConfig {
+                room_size: 0.5,
+                damping: 0.5,
+                mix: 0.3,
+            }),
+        };
+
+        let (left, right) = engine.render_stereo(&song, Some(&effects));
+
+        assert!(!left.is_empty());
+        assert_eq!(left.len(), right.len());
+
+        // Should produce audio
+        let max_l = left.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+        assert!(max_l > 0.001, "Should produce audio with reverb");
+    }
+
+    #[test]
+    fn render_pcm_i16_with_effects() {
+        let engine = AudioEngine::new(44100.0);
+        let song = make_simple_song();
+
+        let effects = MasterEffects {
+            delay: Some(DelayConfig::default()),
+            reverb: Some(ReverbConfig::default()),
+        };
+
+        let pcm = engine.render_pcm_i16_with_effects(&song, &effects);
+
+        // Should be interleaved stereo (twice as many samples)
+        let mono = engine.render(&song);
+        assert_eq!(pcm.len(), mono.len() * 2);
+
+        // Should produce non-zero audio
+        let max = pcm.iter().fold(0_i16, |m, &s| m.max(s.abs()));
+        assert!(max > 100, "Should produce significant audio");
     }
 }
