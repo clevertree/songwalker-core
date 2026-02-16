@@ -1005,4 +1005,255 @@ track riff() {
             assert_eq!(instrument.waveform, "sawtooth");
         }
     }
+
+    // ── loadPreset tests ────────────────────────────────────
+
+    #[test]
+    fn test_load_preset_sets_preset_ref() {
+        // loadPreset("name") should set preset_ref on the instrument config.
+        let program = parse(
+            r#"
+const piano = loadPreset("FluidR3_GM/Acoustic Grand Piano");
+track riff() {
+    track.instrument = piano;
+    C3 /4
+}
+riff();
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+        let note = events.events.iter().find(|e| matches!(&e.kind, EventKind::Note { .. })).unwrap();
+        if let EventKind::Note { instrument, .. } = &note.kind {
+            assert_eq!(
+                instrument.preset_ref,
+                Some("FluidR3_GM/Acoustic Grand Piano".to_string())
+            );
+        } else {
+            panic!("Expected Note event");
+        }
+    }
+
+    #[test]
+    fn test_load_preset_emits_preset_ref_event() {
+        // A const decl with loadPreset should emit a PresetRef event for preloading.
+        let program = parse(
+            r#"
+const piano = loadPreset("FluidR3_GM/Acoustic Grand Piano");
+track riff() {
+    track.instrument = piano;
+    C3 /4
+}
+riff();
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+        let preset_refs: Vec<_> = events
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::PresetRef { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(preset_refs, vec!["FluidR3_GM/Acoustic Grand Piano"]);
+    }
+
+    #[test]
+    fn test_extract_preset_refs() {
+        // extract_preset_refs should collect unique preset references.
+        let program = parse(
+            r#"
+const piano = loadPreset("FluidR3_GM/Acoustic Grand Piano");
+const guitar = loadPreset("FluidR3_GM/Nylon Guitar");
+track riff() {
+    track.instrument = piano;
+    C3 /4
+}
+riff();
+"#,
+        )
+        .unwrap();
+
+        let event_list = compile(&program).unwrap();
+        let refs = extract_preset_refs(&event_list);
+        assert_eq!(refs.len(), 2);
+        assert!(refs.contains(&"FluidR3_GM/Acoustic Grand Piano".to_string()));
+        assert!(refs.contains(&"FluidR3_GM/Nylon Guitar".to_string()));
+    }
+
+    #[test]
+    fn test_extract_preset_refs_deduplicates() {
+        // Same preset referenced twice should appear only once.
+        let program = parse(
+            r#"
+const a = loadPreset("FluidR3_GM/Piano");
+const b = loadPreset("FluidR3_GM/Piano");
+track riff() {
+    track.instrument = a;
+    C3 /4
+}
+riff();
+"#,
+        )
+        .unwrap();
+
+        let event_list = compile(&program).unwrap();
+        let refs = extract_preset_refs(&event_list);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], "FluidR3_GM/Piano");
+    }
+
+    #[test]
+    fn test_load_preset_default_waveform() {
+        // loadPreset for an external preset should still use default waveform.
+        let program = parse(
+            r#"
+const p = loadPreset("SomeLibrary/SomeInstrument");
+track riff() {
+    track.instrument = p;
+    C3 /4
+}
+riff();
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+        let note = events.events.iter().find(|e| matches!(&e.kind, EventKind::Note { .. })).unwrap();
+        if let EventKind::Note { instrument, .. } = &note.kind {
+            // External presets keep default waveform; runtime replaces it.
+            assert_eq!(instrument.waveform, "triangle");
+            assert_eq!(
+                instrument.preset_ref,
+                Some("SomeLibrary/SomeInstrument".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_preset_oscillator_special_case() {
+        // loadPreset("Oscillator", {type: 'square'}) should configure waveform.
+        let program = parse(
+            r#"
+const osc = loadPreset("Oscillator", {type: 'square', attack: 0.1});
+track riff() {
+    track.instrument = osc;
+    C3 /4
+}
+riff();
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+        let note = events.events.iter().find(|e| matches!(&e.kind, EventKind::Note { .. })).unwrap();
+        if let EventKind::Note { instrument, .. } = &note.kind {
+            assert_eq!(instrument.waveform, "square");
+            assert_eq!(instrument.attack, Some(0.1));
+            assert_eq!(instrument.preset_ref, Some("Oscillator".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_unknown_instrument_function_errors() {
+        // An unknown function name (not Oscillator or loadPreset) should error.
+        let program = parse(
+            r#"
+const x = unknownFunc("foo");
+track riff() {
+    track.instrument = x;
+    C3 /4
+}
+riff();
+"#,
+        )
+        .unwrap();
+
+        let result = compile(&program);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Unknown instrument preset 'unknownFunc'"));
+    }
+
+    #[test]
+    fn test_load_preset_no_args() {
+        // loadPreset() with no arguments — preset_ref should be None.
+        let program = parse(
+            r#"
+const p = loadPreset();
+track riff() {
+    track.instrument = p;
+    C3 /4
+}
+riff();
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+        let note = events.events.iter().find(|e| matches!(&e.kind, EventKind::Note { .. })).unwrap();
+        if let EventKind::Note { instrument, .. } = &note.kind {
+            assert_eq!(instrument.preset_ref, None);
+        }
+    }
+
+    #[test]
+    fn test_load_preset_passed_as_track_param() {
+        // loadPreset value passed as a track parameter should propagate correctly.
+        let program = parse(
+            r#"
+const piano = loadPreset("FluidR3_GM/Acoustic Grand Piano");
+melody(piano);
+
+track melody(inst) {
+    track.instrument = inst;
+    C4 /4
+    E4 /4
+}
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+        let notes: Vec<_> = events
+            .events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::Note { .. }))
+            .collect();
+        assert_eq!(notes.len(), 2);
+        for note in &notes {
+            if let EventKind::Note { instrument, .. } = &note.kind {
+                assert_eq!(
+                    instrument.preset_ref,
+                    Some("FluidR3_GM/Acoustic Grand Piano".to_string())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_preset_refs_empty_when_no_presets() {
+        // Songs without loadPreset should return empty refs.
+        let program = parse(
+            r#"
+const synth = Oscillator({type: 'square'});
+track riff() {
+    track.instrument = synth;
+    C3 /4
+}
+riff();
+"#,
+        )
+        .unwrap();
+
+        let event_list = compile(&program).unwrap();
+        let refs = extract_preset_refs(&event_list);
+        assert!(refs.is_empty());
+    }
 }
