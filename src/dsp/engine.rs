@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use crate::compiler::{EndMode, EventKind, EventList, InstrumentConfig};
 
+use super::chorus::Chorus;
 use super::composite::{CompositeInstrument, CompositeVoice};
+use super::compressor::Compressor;
 use super::delay::Delay;
 use super::mixer::Mixer;
 use super::reverb::Reverb;
@@ -178,6 +180,10 @@ pub struct MasterEffects {
     pub delay: Option<DelayConfig>,
     /// Reverb effect configuration.
     pub reverb: Option<ReverbConfig>,
+    /// Chorus effect configuration.
+    pub chorus: Option<ChorusConfig>,
+    /// Compressor configuration.
+    pub compressor: Option<CompressorConfig>,
 }
 
 /// Configuration for the delay effect.
@@ -222,11 +228,61 @@ impl Default for ReverbConfig {
     }
 }
 
+/// Configuration for the chorus effect.
+#[derive(Debug, Clone, Copy)]
+pub struct ChorusConfig {
+    /// LFO rate in Hz.
+    pub rate: f64,
+    /// Modulation depth in seconds.
+    pub depth: f64,
+    /// Dry/wet mix (0.0 to 1.0).
+    pub mix: f64,
+}
+
+impl Default for ChorusConfig {
+    fn default() -> Self {
+        Self {
+            rate: 1.5,
+            depth: 0.002,
+            mix: 0.3,
+        }
+    }
+}
+
+/// Configuration for the compressor effect.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressorConfig {
+    /// Threshold in dB.
+    pub threshold: f64,
+    /// Compression ratio.
+    pub ratio: f64,
+    /// Attack time in seconds.
+    pub attack: f64,
+    /// Release time in seconds.
+    pub release: f64,
+    /// Makeup gain in dB.
+    pub makeup_gain: f64,
+}
+
+impl Default for CompressorConfig {
+    fn default() -> Self {
+        Self {
+            threshold: -24.0,
+            ratio: 4.0,
+            attack: 0.003,
+            release: 0.25,
+            makeup_gain: 0.0,
+        }
+    }
+}
+
 impl Default for MasterEffects {
     fn default() -> Self {
         Self {
             delay: None,
             reverb: None,
+            chorus: None,
+            compressor: None,
         }
     }
 }
@@ -474,6 +530,7 @@ impl AudioEngine {
     /// Render to stereo f32 samples with optional master effects.
     ///
     /// Returns (left_channel, right_channel) as separate vectors.
+    /// Effects are applied in order: Chorus -> Delay -> Reverb -> Compressor
     pub fn render_stereo(&self, event_list: &EventList, effects: Option<&MasterEffects>) -> (Vec<f32>, Vec<f32>) {
         let mono = self.render(event_list);
 
@@ -483,7 +540,18 @@ impl AudioEngine {
 
         // Apply effects if configured
         if let Some(fx) = effects {
-            // Apply delay first
+            // 1. Chorus (thickening before space effects)
+            if let Some(chorus_cfg) = &fx.chorus {
+                let mut chorus = Chorus::with_params(
+                    self.sample_rate,
+                    chorus_cfg.rate,
+                    chorus_cfg.depth,
+                    chorus_cfg.mix,
+                );
+                chorus.process_block(&mut left, &mut right);
+            }
+
+            // 2. Delay
             if let Some(delay_cfg) = &fx.delay {
                 let mut delay = Delay::with_params(
                     self.sample_rate,
@@ -495,7 +563,7 @@ impl AudioEngine {
                 delay.process_block(&mut left, &mut right);
             }
 
-            // Apply reverb after delay
+            // 3. Reverb
             if let Some(reverb_cfg) = &fx.reverb {
                 let mut reverb = Reverb::with_params(
                     self.sample_rate,
@@ -504,6 +572,19 @@ impl AudioEngine {
                     reverb_cfg.mix,
                 );
                 reverb.process_block(&mut left, &mut right);
+            }
+
+            // 4. Compressor (last in chain for level control)
+            if let Some(comp_cfg) = &fx.compressor {
+                let mut compressor = Compressor::with_params(
+                    self.sample_rate,
+                    comp_cfg.threshold,
+                    comp_cfg.ratio,
+                    comp_cfg.attack,
+                    comp_cfg.release,
+                );
+                compressor.makeup_gain = comp_cfg.makeup_gain;
+                compressor.process_block(&mut left, &mut right);
             }
         }
 
@@ -1179,6 +1260,8 @@ mod tests {
                 mix: 0.5,
             }),
             reverb: None,
+            chorus: None,
+            compressor: None,
         };
 
         let (left, right) = engine.render_stereo(&song, Some(&effects));
@@ -1203,6 +1286,8 @@ mod tests {
                 damping: 0.5,
                 mix: 0.3,
             }),
+            chorus: None,
+            compressor: None,
         };
 
         let (left, right) = engine.render_stereo(&song, Some(&effects));
@@ -1223,6 +1308,8 @@ mod tests {
         let effects = MasterEffects {
             delay: Some(DelayConfig::default()),
             reverb: Some(ReverbConfig::default()),
+            chorus: None,
+            compressor: None,
         };
 
         let pcm = engine.render_pcm_i16_with_effects(&song, &effects);
@@ -1234,5 +1321,85 @@ mod tests {
         // Should produce non-zero audio
         let max = pcm.iter().fold(0_i16, |m, &s| m.max(s.abs()));
         assert!(max > 100, "Should produce significant audio");
+    }
+
+    #[test]
+    fn render_stereo_with_chorus() {
+        let engine = AudioEngine::new(44100.0);
+        let song = make_simple_song();
+
+        let effects = MasterEffects {
+            delay: None,
+            reverb: None,
+            chorus: Some(ChorusConfig {
+                rate: 2.0,
+                depth: 0.003,
+                mix: 0.5,
+            }),
+            compressor: None,
+        };
+
+        let (left, right) = engine.render_stereo(&song, Some(&effects));
+
+        assert!(!left.is_empty());
+        assert_eq!(left.len(), right.len());
+
+        // Should produce audio
+        let max_l = left.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+        assert!(max_l > 0.001, "Should produce audio with chorus");
+
+        // Chorus creates stereo spread, so L and R may differ
+        // (after the initial delay fills)
+    }
+
+    #[test]
+    fn render_stereo_with_compressor() {
+        let engine = AudioEngine::new(44100.0);
+        let song = make_simple_song();
+
+        let effects = MasterEffects {
+            delay: None,
+            reverb: None,
+            chorus: None,
+            compressor: Some(CompressorConfig {
+                threshold: -20.0,
+                ratio: 4.0,
+                attack: 0.001,
+                release: 0.1,
+                makeup_gain: 0.0,
+            }),
+        };
+
+        let (left, right) = engine.render_stereo(&song, Some(&effects));
+
+        assert!(!left.is_empty());
+        assert_eq!(left.len(), right.len());
+
+        // Should produce audio
+        let max_l = left.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+        assert!(max_l > 0.001, "Should produce audio with compressor");
+    }
+
+    #[test]
+    fn render_stereo_full_effects_chain() {
+        let engine = AudioEngine::new(44100.0);
+        let song = make_simple_song();
+
+        // All effects enabled
+        let effects = MasterEffects {
+            chorus: Some(ChorusConfig::default()),
+            delay: Some(DelayConfig::default()),
+            reverb: Some(ReverbConfig::default()),
+            compressor: Some(CompressorConfig::default()),
+        };
+
+        let (left, right) = engine.render_stereo(&song, Some(&effects));
+
+        assert!(!left.is_empty());
+        assert_eq!(left.len(), right.len());
+
+        // Should produce audio
+        let max_l = left.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+        assert!(max_l > 0.001, "Full effects chain should produce audio");
     }
 }

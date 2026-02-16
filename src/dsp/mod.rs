@@ -4,7 +4,9 @@
 //! The same code powers both the WebAudio (via AudioWorklet + WASM) and
 //! the CLI renderer (offline WAV export).
 
+pub mod chorus;
 pub mod composite;
+pub mod compressor;
 pub mod delay;
 pub mod engine;
 pub mod envelope;
