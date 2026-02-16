@@ -56,6 +56,26 @@ cd /home/ari/dev/songwalker-vsti && git add -A && git commit -m "..." && git pus
 
 Only commit downstream repos if they have actual changes (check `git status` first).
 
+### 5. Verify GitHub Actions
+After pushing, check that any triggered GitHub Actions workflows succeed:
+```bash
+# Check runs for each repo that has workflows
+cd /home/ari/dev/songwalker-vsti && gh run list --limit 3
+
+# Watch a specific run (get ID from run list)
+gh run watch <run-id>
+
+# View logs for a failed run
+gh run view <run-id> --log-failed
+```
+
+If a workflow fails, inspect the logs, fix the issue, and push again.
+Repeat until the workflow passes before moving on.
+
+**Current workflow triggers:**
+- **songwalker-vsti** — `Build & Release` runs on tag pushes (`v*`) and `workflow_dispatch`
+- **songwalker-core, songwalker-web, songwalker-cli** — no workflows yet
+
 ## Version
 
 The crate version lives in `Cargo.toml` (`version = "..."`) and is exposed at runtime via:
