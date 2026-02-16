@@ -12,6 +12,15 @@ use crate::lexer::Lexer;
 use crate::parser::Parser;
 use wasm_bindgen::prelude::*;
 
+/// The crate version, read from Cargo.toml at compile time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// WASM-exposed: return the songwalker-core version string.
+#[wasm_bindgen]
+pub fn core_version() -> String {
+    VERSION.to_string()
+}
+
 /// Parse a `.sw` source string into a `Program` AST.
 pub fn parse(input: &str) -> Result<ast::Program, SongWalkerError> {
     let tokens = Lexer::new(input).tokenize()?;
