@@ -24,6 +24,8 @@ Both are clocked from the CPU and produce digital output that passes through a D
 
 We can optionally offer analog-stage modeling as a post-effect preset for users who want that specific Game Boy model's color.
 
+> **Note — ProSoundMod:** A very common hardware modification ("ProSoundMod") brings the audio output pins straight to a second audio jack, modulated only by the volume knob, bypassing the console's built-in amp and filtering entirely. This reinforces the focus on generator-level emulation — many real-world users are already listening to the raw generator output through a ProSoundMod.
+
 ---
 
 ## 2. Current State of the Oscillator
@@ -175,8 +177,11 @@ GB_Wave           — wavetable, default sine wave table, 4-bit DAC
 GB_Noise          — LFSR noise, 15-bit/7-bit selectable, 4-bit volume
 
 GB_Pulse_25       — pulse, duty 25% (common Game Boy sound)
+GB_Pulse_75       — pulse, duty 75% (inverted 25% — may produce interesting effects when superimposed with 25%)
 GB_Pulse_125      — pulse, duty 12.5% (thin/nasal)
 ```
+
+> **Note — GB_Pulse_75:** 75% duty is the inverse of 25%. While seemingly redundant, superimposing the two could create interesting phase-cancellation or reinforcement effects. This should be verified with an oscilloscope.
 
 #### Composite presets for full-system emulation
 
@@ -490,6 +495,8 @@ PresetDescriptor {
 4. **Channel count enforcement** — Real hardware has strict channel limits (NES: 5, GB: 4). Should the preset system enforce these limits when using a full-system preset? Proposal: no enforcement — let users layer freely, but document authentic constraints.
 
 5. **Wave RAM** — On real GB hardware, wave RAM can be written while the channel plays, creating glitch effects. Support this as a feature or ignore? Proposal: ignore for now, possibly add as a "wave_table_modulation" feature later.
+
+   > **Context:** Writing to wave RAM during playback is common for more than just glitch effects. With careful timing, it enables streaming samples of arbitrary length through the wave channel — effectively turning the 32-sample wave buffer into a ring buffer. LSDj (the popular Game Boy tracker) uses this technique extensively. **Didrik Madheden (nitro2k01)** is a good resource on Game Boy sound hardware internals and techniques like this.
 
 ---
 

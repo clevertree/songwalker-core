@@ -176,3 +176,10 @@ The same Rust code powers both the WASM web player and the native CLI renderer, 
 ## License
 
 MIT
+
+---
+
+> *"Perfection is achieved, not when there is nothing more to add,*
+> *but when there is nothing left to take away."*
+>
+> — Antoine de Saint-Exupéry
