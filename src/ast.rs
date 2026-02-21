@@ -14,6 +14,8 @@ pub enum Statement {
         name: String,
         params: Vec<String>,
         body: Vec<TrackStatement>,
+        span_start: usize,
+        span_end: usize,
     },
     /// `name*vel@dur(args) step;`
     TrackCall {
@@ -22,11 +24,23 @@ pub enum Statement {
         play_duration: Option<DurationExpr>,
         args: Vec<Expr>,
         step: Option<DurationExpr>,
+        span_start: usize,
+        span_end: usize,
     },
     /// `const name = expr;`
-    ConstDecl { name: String, value: Expr },
+    ConstDecl {
+        name: String,
+        value: Expr,
+        span_start: usize,
+        span_end: usize,
+    },
     /// `target = value;`
-    Assignment { target: String, value: Expr },
+    Assignment {
+        target: String,
+        value: Expr,
+        span_start: usize,
+        span_end: usize,
+    },
     /// `// text`
     Comment(String),
 }
@@ -56,15 +70,26 @@ pub enum TrackStatement {
         span_end: usize,
     },
     /// Standalone number = rest for N beats.
-    Rest(DurationExpr),
+    Rest {
+        duration: DurationExpr,
+        span_start: usize,
+        span_end: usize,
+    },
     /// `target = value;`
-    Assignment { target: String, value: Expr },
+    Assignment {
+        target: String,
+        value: Expr,
+        span_start: usize,
+        span_end: usize,
+    },
     /// `for (init; cond; update) { body }`
     ForLoop {
         init: String,
         condition: String,
         update: String,
         body: Vec<TrackStatement>,
+        span_start: usize,
+        span_end: usize,
     },
     /// A track call inside another track.
     TrackCall {
@@ -73,6 +98,8 @@ pub enum TrackStatement {
         play_duration: Option<DurationExpr>,
         args: Vec<Expr>,
         step: Option<DurationExpr>,
+        span_start: usize,
+        span_end: usize,
     },
     /// `// text`
     Comment(String),
@@ -117,4 +144,36 @@ pub enum Expr {
         property: String,
     },
     DurationLit(DurationExpr),
+}
+
+// ── Span accessors ──────────────────────────────────────────
+
+impl Statement {
+    /// Returns the source byte range `(span_start, span_end)` for this statement.
+    /// Comments have no span information and return `(usize::MAX, usize::MAX)`.
+    pub fn span(&self) -> (usize, usize) {
+        match self {
+            Statement::TrackDef { span_start, span_end, .. }
+            | Statement::TrackCall { span_start, span_end, .. }
+            | Statement::ConstDecl { span_start, span_end, .. }
+            | Statement::Assignment { span_start, span_end, .. } => (*span_start, *span_end),
+            Statement::Comment(_) => (usize::MAX, usize::MAX),
+        }
+    }
+}
+
+impl TrackStatement {
+    /// Returns the source byte range `(span_start, span_end)` for this statement.
+    /// Comments have no span information and return `(usize::MAX, usize::MAX)`.
+    pub fn span(&self) -> (usize, usize) {
+        match self {
+            TrackStatement::NoteEvent { span_start, span_end, .. }
+            | TrackStatement::Chord { span_start, span_end, .. }
+            | TrackStatement::Rest { span_start, span_end, .. }
+            | TrackStatement::Assignment { span_start, span_end, .. }
+            | TrackStatement::ForLoop { span_start, span_end, .. }
+            | TrackStatement::TrackCall { span_start, span_end, .. } => (*span_start, *span_end),
+            TrackStatement::Comment(_) => (usize::MAX, usize::MAX),
+        }
+    }
 }

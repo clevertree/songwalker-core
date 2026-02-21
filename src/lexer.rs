@@ -3,14 +3,28 @@ use crate::token::{Span, Spanned, Token};
 
 pub struct Lexer {
     chars: Vec<char>,
+    /// Precomputed byte offset for each char index.
+    /// `byte_offsets[i]` = byte offset of `chars[i]` in the original `&str`.
+    /// `byte_offsets[chars.len()]` = total byte length (sentinel for EOF).
+    byte_offsets: Vec<usize>,
     pos: usize,
     prev_significant: Option<Token>,
 }
 
 impl Lexer {
     pub fn new(input: &str) -> Self {
+        let chars: Vec<char> = input.chars().collect();
+        // Build a lookup table: char index → byte offset.
+        let mut byte_offsets = Vec::with_capacity(chars.len() + 1);
+        let mut offset = 0;
+        for ch in &chars {
+            byte_offsets.push(offset);
+            offset += ch.len_utf8();
+        }
+        byte_offsets.push(offset); // sentinel for EOF
         Lexer {
-            chars: input.chars().collect(),
+            chars,
+            byte_offsets,
             pos: 0,
             prev_significant: None,
         }
@@ -73,12 +87,17 @@ impl Lexer {
         }
     }
 
+    /// Convert a char index to a byte offset.
+    fn byte_pos_of(&self, char_idx: usize) -> usize {
+        self.byte_offsets[char_idx.min(self.chars.len())]
+    }
+
     fn spanned(&self, token: Token, start: usize) -> Spanned {
         Spanned {
             token,
             span: Span {
-                start,
-                end: self.pos,
+                start: self.byte_pos_of(start),
+                end: self.byte_pos_of(self.pos),
             },
         }
     }
@@ -191,7 +210,7 @@ impl Lexer {
             '"' | '\'' => self.lex_string(start),
             c if c.is_ascii_digit() => self.lex_number(start),
             c if c.is_ascii_alphabetic() || c == '_' => self.lex_ident(start),
-            _ => Err(LexError::UnexpectedChar { ch, pos: start }),
+            _ => Err(LexError::UnexpectedChar { ch, pos: self.byte_pos_of(start) }),
         }
     }
 
@@ -219,10 +238,10 @@ impl Lexer {
                         s.push('\\');
                         s.push(c);
                     }
-                    None => return Err(LexError::UnterminatedString { pos: start }),
+                    None => return Err(LexError::UnterminatedString { pos: self.byte_pos_of(start) }),
                 },
                 Some(c) => s.push(c),
-                None => return Err(LexError::UnterminatedString { pos: start }),
+                None => return Err(LexError::UnterminatedString { pos: self.byte_pos_of(start) }),
             }
         }
         Ok(self.spanned(Token::StringLit(s), start))
@@ -238,11 +257,11 @@ impl Lexer {
                     pattern.push('\\');
                     match self.advance() {
                         Some(c) => pattern.push(c),
-                        None => return Err(LexError::UnterminatedRegex { pos: start }),
+                        None => return Err(LexError::UnterminatedRegex { pos: self.byte_pos_of(start) }),
                     }
                 }
                 Some(c) => pattern.push(c),
-                None => return Err(LexError::UnterminatedRegex { pos: start }),
+                None => return Err(LexError::UnterminatedRegex { pos: self.byte_pos_of(start) }),
             }
         }
         // Consume flags (e.g., /pattern/gi)
@@ -277,7 +296,7 @@ impl Lexer {
         let text: String = self.chars[start..self.pos].iter().collect();
         let num: f64 = text.parse().map_err(|_| LexError::InvalidNumber {
             text: text.clone(),
-            pos: start,
+            pos: self.byte_pos_of(start),
         })?;
         Ok(self.spanned(Token::Number(num), start))
     }

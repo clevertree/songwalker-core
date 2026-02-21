@@ -271,3 +271,166 @@ pub fn render_song_wav_with_presets(
     let pcm = engine.render_pcm_i16(&event_list);
     Ok(dsp::renderer::encode_wav_public(&pcm, sample_rate, 2))
 }
+
+// ── Piano Keyboard: Single Note Rendering ───────────────────
+
+/// WASM-exposed: query the compilation state at a given cursor byte offset.
+///
+/// Returns a JSON object with the active instrument, BPM, tuning, note length,
+/// track name, and beat position at the cursor. Used by the editor to determine
+/// which instrument to preview when a piano key is pressed.
+#[wasm_bindgen]
+pub fn get_instrument_at_cursor(
+    source: &str,
+    cursor_byte_offset: usize,
+) -> Result<JsValue, JsValue> {
+    let ctx = compiler::cursor_context(source, cursor_byte_offset)
+        .map_err(|e| JsValue::from_str(&e))?;
+    serde_wasm_bindgen::to_value(&ctx).map_err(|e| JsValue::from_str(&format!("{e}")))
+}
+
+/// WASM-exposed: render a single note to mono f32 PCM samples.
+///
+/// Used by the piano keyboard to preview notes with the instrument active
+/// at the cursor. Constructs a minimal EventList, renders through the
+/// AudioEngine with `EndMode::Release`, and caps at 4 seconds.
+///
+/// * `pitch` — note name (e.g. "C4", "A3")
+/// * `velocity` — note velocity 0–127
+/// * `gate_beats` — audible note duration in beats
+/// * `bpm` — tempo for beat→seconds conversion
+/// * `tuning_pitch` — A4 reference frequency (e.g. 440.0)
+/// * `sample_rate` — output sample rate
+/// * `instrument_json` — `InstrumentConfig` serialized as JSON
+/// * `presets_json` — optional JSON array of loaded preset data (pass "[]" if none)
+#[wasm_bindgen]
+pub fn render_single_note(
+    pitch: &str,
+    velocity: f64,
+    gate_beats: f64,
+    bpm: f64,
+    tuning_pitch: f64,
+    sample_rate: u32,
+    instrument_json: &str,
+    presets_json: &str,
+) -> Result<Vec<f32>, JsValue> {
+    let instrument: compiler::InstrumentConfig = serde_json::from_str(instrument_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid instrument JSON: {e}")))?;
+
+    // Build a minimal EventList with one note.
+    let event_list = compiler::EventList {
+        events: vec![
+            // Set BPM
+            compiler::Event {
+                time: 0.0,
+                kind: compiler::EventKind::SetProperty {
+                    target: "track.beatsPerMinute".to_string(),
+                    value: format!("{bpm}"),
+                },
+                track_name: None,
+            },
+            // Set tuning
+            compiler::Event {
+                time: 0.0,
+                kind: compiler::EventKind::SetProperty {
+                    target: "track.tuningPitch".to_string(),
+                    value: format!("{tuning_pitch}"),
+                },
+                track_name: None,
+            },
+            // The note
+            compiler::Event {
+                time: 0.0,
+                kind: compiler::EventKind::Note {
+                    pitch: pitch.to_string(),
+                    velocity,
+                    gate: gate_beats,
+                    instrument,
+                    source_start: 0,
+                    source_end: 0,
+                },
+                track_name: None,
+            },
+        ],
+        total_beats: gate_beats,
+        end_mode: compiler::EndMode::Release,
+    };
+
+    let mut engine = dsp::engine::AudioEngine::new(sample_rate as f64);
+
+    // Register presets if provided.
+    if presets_json != "[]" && !presets_json.is_empty() {
+        let presets: Vec<WasmLoadedPreset> = serde_json::from_str(presets_json)
+            .map_err(|e| JsValue::from_str(&format!("Failed to parse presets JSON: {e}")))?;
+        for preset in &presets {
+            let registered = build_preset(preset);
+            match registered {
+                dsp::engine::RegisteredPreset::Sampler(s) =>
+                    engine.register_preset(preset.name.clone(), s),
+                dsp::engine::RegisteredPreset::Composite(c) =>
+                    engine.register_composite(preset.name.clone(), c),
+            }
+        }
+    }
+
+    let samples_f64 = engine.render(&event_list);
+
+    // Cap at 4 seconds.
+    let max_samples = (4.0 * sample_rate as f64) as usize;
+    let capped = if samples_f64.len() > max_samples {
+        &samples_f64[..max_samples]
+    } else {
+        &samples_f64
+    };
+
+    Ok(capped.iter().map(|&s| s as f32).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_single_note_produces_audio() {
+        // Build the same minimal EventList that render_single_note does,
+        // but call the engine directly (no WASM).
+        let instrument = compiler::InstrumentConfig::default(); // triangle
+        let event_list = compiler::EventList {
+            events: vec![
+                compiler::Event {
+                    time: 0.0,
+                    kind: compiler::EventKind::SetProperty {
+                        target: "track.beatsPerMinute".to_string(),
+                        value: "120".to_string(),
+                    },
+                    track_name: None,
+                },
+                compiler::Event {
+                    time: 0.0,
+                    kind: compiler::EventKind::Note {
+                        pitch: "A4".to_string(),
+                        velocity: 100.0,
+                        gate: 1.0,
+                        instrument,
+                        source_start: 0,
+                        source_end: 0,
+                    },
+                    track_name: None,
+                },
+            ],
+            total_beats: 1.0,
+            end_mode: compiler::EndMode::Release,
+        };
+
+        let engine = dsp::engine::AudioEngine::new(44100.0);
+        let samples = engine.render(&event_list);
+
+        // Should produce non-silent output.
+        assert!(!samples.is_empty());
+        assert!(samples.iter().any(|&s| s.abs() > 0.001));
+
+        // Should be capped reasonably (1 beat at 120 BPM = 0.5s + release).
+        let max_samples = (4.0 * 44100.0) as usize;
+        assert!(samples.len() <= max_samples);
+    }
+}

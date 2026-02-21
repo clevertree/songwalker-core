@@ -84,6 +84,8 @@ pub struct Event {
     /// When this event fires, in beats from the start.
     pub time: f64,
     pub kind: EventKind,
+    /// Track that produced this event (None = top-level).
+    pub track_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -114,6 +116,27 @@ pub enum EventKind {
     PresetRef { name: String },
 }
 
+// ── Cursor Context ──────────────────────────────────────────
+
+/// State snapshot at a given cursor position in the source.
+/// Used by the editor to determine what instrument/BPM/etc. is active
+/// at the cursor, enabling features like piano keyboard preview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorContext {
+    /// The instrument configuration active at the cursor.
+    pub instrument: InstrumentConfig,
+    /// The track the cursor is inside (None = top-level).
+    pub track_name: Option<String>,
+    /// Default note length in beats at the cursor.
+    pub note_length: f64,
+    /// Beats per minute at the cursor.
+    pub bpm: f64,
+    /// Tuning reference pitch (A4) in Hz at the cursor.
+    pub tuning_pitch: f64,
+    /// Beat position at the cursor.
+    pub cursor_beat: f64,
+}
+
 // ── Compiler ────────────────────────────────────────────────
 
 /// Compile context: tracks state during compilation.
@@ -126,6 +149,12 @@ struct CompileCtx {
     current_instrument: InstrumentConfig,
     /// Current cursor position in beats.
     cursor: f64,
+    /// Maximum cursor position reached by any track (for total_beats).
+    /// Track calls are async (parallel) — they don't advance the caller's
+    /// cursor. This field captures the furthest beat any track reached.
+    max_cursor: f64,
+    /// Name of the track currently being compiled (None = top-level).
+    current_track_name: Option<String>,
     /// Collected events.
     events: Vec<Event>,
     /// Track definitions available for lookup.
@@ -149,6 +178,8 @@ impl CompileCtx {
             end_mode: EndMode::Tail,
             current_instrument: InstrumentConfig::default(),
             cursor: 0.0,
+            max_cursor: 0.0,
+            current_track_name: None,
             events: Vec::new(),
             track_defs: Vec::new(),
             consts: HashMap::new(),
@@ -160,6 +191,7 @@ impl CompileCtx {
         self.events.push(Event {
             time: self.cursor,
             kind,
+            track_name: self.current_track_name.clone(),
         });
     }
 
@@ -213,7 +245,7 @@ fn compile_inner(program: &Program, strict: bool) -> Result<EventList, String> {
 
     // First pass: collect track definitions.
     for stmt in &program.statements {
-        if let Statement::TrackDef { name, params, body } = stmt {
+        if let Statement::TrackDef { name, params, body, .. } = stmt {
             ctx.track_defs.push(TrackDef {
                 name: name.clone(),
                 params: params.clone(),
@@ -230,7 +262,7 @@ fn compile_inner(program: &Program, strict: bool) -> Result<EventList, String> {
     ctx.events.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
 
     Ok(EventList {
-        total_beats: ctx.cursor,
+        total_beats: ctx.cursor.max(ctx.max_cursor),
         events: ctx.events,
         end_mode: ctx.end_mode,
     })
@@ -248,10 +280,11 @@ fn compile_statement(ctx: &mut CompileCtx, stmt: &Statement) -> Result<(), Strin
             play_duration,
             args,
             step,
+            ..
         } => {
             inline_track_call(ctx, name, velocity, play_duration, args, step)
         }
-        Statement::ConstDecl { name, value } => {
+        Statement::ConstDecl { name, value, .. } => {
             // Resolve the expression to an InstrumentConfig and store it.
             let config = evaluate_instrument_expr(ctx, value)?;
             // Emit a PresetRef event if this references an external preset.
@@ -261,12 +294,13 @@ fn compile_statement(ctx: &mut CompileCtx, stmt: &Statement) -> Result<(), Strin
                     kind: EventKind::PresetRef {
                         name: preset_name.clone(),
                     },
+                    track_name: ctx.current_track_name.clone(),
                 });
             }
             ctx.consts.insert(name.clone(), config);
             Ok(())
         }
-        Statement::Assignment { target, value } => {
+        Statement::Assignment { target, value, .. } => {
             compile_assignment(ctx, target, value)
         }
         Statement::Comment(_) => Ok(()),
@@ -479,6 +513,10 @@ fn inline_track_call(
         let saved_note_len = ctx.default_note_length;
         let saved_instrument = ctx.current_instrument.clone();
         let saved_params = ctx.param_bindings.clone();
+        let saved_track_name = ctx.current_track_name.clone();
+
+        // Set the current track name for event stamping.
+        ctx.current_track_name = Some(name.to_string());
 
         // Resolve args → params: zip track def params with call args.
         let mut new_bindings = ctx.param_bindings.clone();
@@ -497,12 +535,21 @@ fn inline_track_call(
             ctx.cursor = saved_cursor + max_dur;
         }
 
+        // Record the furthest beat this track reached.
+        ctx.max_cursor = ctx.max_cursor.max(ctx.cursor);
+
+        // Async: restore cursor — track calls don't advance the caller's
+        // cursor. Consecutive track calls start at the same beat (parallel).
+        ctx.cursor = saved_cursor;
+
         // Restore parent scope.
         ctx.default_note_length = saved_note_len;
         ctx.current_instrument = saved_instrument;
         ctx.param_bindings = saved_params;
+        ctx.current_track_name = saved_track_name;
 
-        // Apply step (rest after the track call).
+        // Apply explicit step duration (if any).
+        // `melody() 8;` advances cursor by 8 beats *after* the async call.
         if let Some(s) = step {
             let step_beats = duration_to_beats(s, ctx.default_note_length);
             ctx.cursor = saved_cursor + step_beats;
@@ -590,11 +637,11 @@ fn compile_track_statement(ctx: &mut CompileCtx, stmt: &TrackStatement) -> Resul
             ctx.cursor += step;
             Ok(())
         }
-        TrackStatement::Rest(dur) => {
-            ctx.cursor += duration_to_beats(dur, ctx.default_note_length);
+        TrackStatement::Rest { duration, .. } => {
+            ctx.cursor += duration_to_beats(duration, ctx.default_note_length);
             Ok(())
         }
-        TrackStatement::Assignment { target, value } => {
+        TrackStatement::Assignment { target, value, .. } => {
             compile_assignment(ctx, target, value)
         }
         TrackStatement::ForLoop {
@@ -602,6 +649,7 @@ fn compile_track_statement(ctx: &mut CompileCtx, stmt: &TrackStatement) -> Resul
             condition: _,
             update: _,
             body,
+            ..
         } => {
             // Phase 1: hardcoded unroll — extract loop count from condition.
             // For now, just compile the body once as a placeholder.
@@ -615,6 +663,7 @@ fn compile_track_statement(ctx: &mut CompileCtx, stmt: &TrackStatement) -> Resul
             play_duration,
             args,
             step,
+            ..
         } => {
             inline_track_call(ctx, name, velocity, play_duration, args, step)
         }
@@ -634,6 +683,108 @@ pub fn extract_preset_refs(event_list: &EventList) -> Vec<String> {
         }
     }
     refs
+}
+
+// ── Cursor Context Query ────────────────────────────────────
+
+/// Determine the compilation state at a given byte offset in the source.
+///
+/// Parses the source, then walks the AST in order, compiling statements whose
+/// `span_start <= cursor_byte_offset`. When the cursor falls inside a track
+/// definition body, descends into that body and stops at the right statement.
+///
+/// Returns the accumulated instrument, BPM, tuning, beat position, etc.
+pub fn cursor_context(source: &str, cursor_byte_offset: usize) -> Result<CursorContext, String> {
+    let program = crate::parse(source).map_err(|e| e.to_string())?;
+    let mut ctx = CompileCtx::new(false);
+    let mut bpm: f64 = 120.0;
+    let mut tuning: f64 = 440.0;
+
+    // First pass: collect track definitions.
+    for stmt in &program.statements {
+        if let Statement::TrackDef { name, params, body, .. } = stmt {
+            ctx.track_defs.push(TrackDef {
+                name: name.clone(),
+                params: params.clone(),
+                body: body.clone(),
+            });
+        }
+    }
+
+    // Second pass: walk statements up to the cursor.
+    for stmt in &program.statements {
+        let (ss, se) = stmt.span();
+
+        // Past the cursor — stop.
+        if ss > cursor_byte_offset {
+            break;
+        }
+
+        // Cursor is inside a track definition — descend into body.
+        if let Statement::TrackDef { body, name, .. } = stmt {
+            if cursor_byte_offset <= se {
+                ctx.current_track_name = Some(name.clone());
+                cursor_walk_track_body(&mut ctx, body, cursor_byte_offset)?;
+                extract_bpm_tuning(&ctx.events, &mut bpm, &mut tuning);
+                return Ok(build_cursor_context(&ctx, bpm, tuning));
+            }
+        }
+
+        // Compile the statement normally.
+        compile_statement(&mut ctx, stmt)?;
+        extract_bpm_tuning(&ctx.events, &mut bpm, &mut tuning);
+    }
+
+    Ok(build_cursor_context(&ctx, bpm, tuning))
+}
+
+/// Walk a track body up to the cursor byte offset, compiling each statement.
+fn cursor_walk_track_body(
+    ctx: &mut CompileCtx,
+    body: &[TrackStatement],
+    cursor_byte_offset: usize,
+) -> Result<(), String> {
+    for stmt in body {
+        let (ss, _se) = stmt.span();
+        if ss > cursor_byte_offset {
+            break;
+        }
+        compile_track_statement(ctx, stmt)?;
+    }
+    Ok(())
+}
+
+/// Scan emitted events for the latest BPM and tuning property changes.
+fn extract_bpm_tuning(events: &[Event], bpm: &mut f64, tuning: &mut f64) {
+    for event in events {
+        if let EventKind::SetProperty { target, value } = &event.kind {
+            match target.as_str() {
+                "track.beatsPerMinute" => {
+                    if let Ok(v) = value.parse::<f64>() {
+                        *bpm = v;
+                    }
+                }
+                "track.tuningPitch" => {
+                    if let Ok(v) = value.parse::<f64>() {
+                        *tuning = v;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Build a CursorContext from the current compile state.
+fn build_cursor_context(ctx: &CompileCtx, bpm: f64, tuning: f64) -> CursorContext {
+    CursorContext {
+        instrument: ctx.current_instrument.clone(),
+        track_name: ctx.current_track_name.clone(),
+        note_length: ctx.default_note_length,
+        bpm,
+        tuning_pitch: tuning,
+        cursor_beat: ctx.cursor,
+    }
 }
 
 #[cfg(test)]
@@ -911,6 +1062,7 @@ track melody(inst) {
     #[test]
     fn test_track_scope_isolation() {
         // Tracks inherit parent state but don't leak changes back.
+        // With async tracks, both start at beat 0 (parallel).
         let program = parse(
             r#"
 const sq = Oscillator({type: 'square'});
@@ -934,13 +1086,50 @@ track melody(inst) {
 
         let events = compile(&program).unwrap();
         let notes: Vec<_> = events.events.iter().filter_map(|e| match &e.kind {
-            EventKind::Note { pitch, instrument, .. } => Some((pitch.as_str(), instrument.waveform.as_str())),
+            EventKind::Note { pitch, instrument, .. } => Some((e.time, pitch.as_str(), instrument.waveform.as_str())),
             _ => None,
         }).collect();
 
-        // bass note should be square, melody note should be triangle
-        assert!(notes.iter().any(|(p, w)| *p == "C2" && *w == "square"));
-        assert!(notes.iter().any(|(p, w)| *p == "C4" && *w == "triangle"));
+        // Both tracks start at beat 0 (async/parallel).
+        assert!(notes.iter().any(|(t, p, w)| *t == 0.0 && *p == "C2" && *w == "square"));
+        assert!(notes.iter().any(|(t, p, w)| *t == 0.0 && *p == "C4" && *w == "triangle"));
+    }
+
+    #[test]
+    fn test_events_carry_track_name() {
+        // Events produced inside a track body should carry that track's name.
+        // Top-level events have track_name = None.
+        let program = parse(
+            r#"
+track.beatsPerMinute = 120;
+
+track melody() {
+    C4 /4
+}
+
+track bass() {
+    C2 /4
+}
+
+melody();
+bass();
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+
+        // Top-level SetProperty (BPM) should have no track name.
+        let bpm_event = events.events.iter().find(|e| matches!(&e.kind, EventKind::SetProperty { target, .. } if target == "track.beatsPerMinute")).unwrap();
+        assert_eq!(bpm_event.track_name, None);
+
+        // Notes inside "melody" should carry track_name = Some("melody").
+        let melody_note = events.events.iter().find(|e| matches!(&e.kind, EventKind::Note { pitch, .. } if pitch == "C4")).unwrap();
+        assert_eq!(melody_note.track_name, Some("melody".to_string()));
+
+        // Notes inside "bass" should carry track_name = Some("bass").
+        let bass_note = events.events.iter().find(|e| matches!(&e.kind, EventKind::Note { pitch, .. } if pitch == "C2")).unwrap();
+        assert_eq!(bass_note.track_name, Some("bass".to_string()));
     }
 
     #[test]
@@ -1255,5 +1444,179 @@ riff();
         let event_list = compile(&program).unwrap();
         let refs = extract_preset_refs(&event_list);
         assert!(refs.is_empty());
+    }
+
+    // ── Async track execution tests ─────────────────────────
+
+    #[test]
+    fn test_parallel_tracks_overlap() {
+        // Two consecutive track calls without explicit step should start at
+        // the same beat (async/parallel), not sequential.
+        let program = parse(
+            r#"
+track melody() {
+    C4 /4
+    D4 /4
+    E4 /4
+}
+
+track bass() {
+    C2 /2
+    D2 /2
+}
+
+melody();
+bass();
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+        let notes: Vec<_> = events
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Note { pitch, .. } => Some((e.time, pitch.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        // melody: C4@0, D4@0.25, E4@0.5
+        // bass:   C2@0, D2@0.5    (parallel, NOT at 0.75/1.25)
+        assert!(notes.iter().any(|(t, p)| *t == 0.0 && *p == "C4"));
+        assert!(notes.iter().any(|(t, p)| *t == 0.25 && *p == "D4"));
+        assert!(notes.iter().any(|(t, p)| *t == 0.5 && *p == "E4"));
+        assert!(notes.iter().any(|(t, p)| *t == 0.0 && *p == "C2"));
+        assert!(notes.iter().any(|(t, p)| *t == 0.5 && *p == "D2"));
+
+        // total_beats = max of both tracks = 1.0 (bass: 0.5 + 0.5)
+        assert_eq!(events.total_beats, 1.0);
+    }
+
+    #[test]
+    fn test_parallel_tracks_with_stagger() {
+        // Explicit step on first track call creates a stagger.
+        // melody() 4; bass();  → melody at beat 0, bass at beat 4
+        let program = parse(
+            r#"
+track melody() {
+    C4 /4
+}
+
+track bass() {
+    C2 /4
+}
+
+melody() 4;
+bass();
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+        let notes: Vec<_> = events
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Note { pitch, .. } => Some((e.time, pitch.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        assert!(notes.iter().any(|(t, p)| *t == 0.0 && *p == "C4"));
+        assert!(notes.iter().any(|(t, p)| *t == 4.0 && *p == "C2"));
+    }
+
+    #[test]
+    fn test_total_beats_reflects_longest_track() {
+        // total_beats should be the max extent of all parallel tracks.
+        let program = parse(
+            r#"
+track short() {
+    C4 /4
+}
+
+track long() {
+    C2 1
+    D2 1
+    E2 1
+    F2 1
+}
+
+short();
+long();
+"#,
+        )
+        .unwrap();
+
+        let events = compile(&program).unwrap();
+        // short: 0.25 beats. long: 4 beats.
+        // total_beats = max(0, 4.0) = 4.0  (cursor restored to 0, max_cursor = 4)
+        assert_eq!(events.total_beats, 4.0);
+    }
+
+    // ── cursor_context tests ────────────────────────────────
+
+    #[test]
+    fn test_cursor_context_top_level_defaults() {
+        let source = r#"
+track riff() {
+    C3 /4
+}
+riff();
+"#;
+        // Cursor at the very start — should get defaults.
+        let ctx = cursor_context(source, 0).unwrap();
+        assert_eq!(ctx.bpm, 120.0);
+        assert_eq!(ctx.tuning_pitch, 440.0);
+        assert_eq!(ctx.note_length, 1.0);
+        assert!(ctx.track_name.is_none());
+    }
+
+    #[test]
+    fn test_cursor_context_after_bpm_assignment() {
+        let source = "track.beatsPerMinute = 140;\ntrack riff() { C3 /4 }\nriff();";
+        // Cursor past the BPM assignment — should see 140 BPM.
+        let ctx = cursor_context(source, 30).unwrap();
+        assert_eq!(ctx.bpm, 140.0);
+    }
+
+    #[test]
+    fn test_cursor_context_inside_track_def() {
+        let source = r#"const lead = Oscillator({type: "square"});
+track melody() {
+    track.instrument = lead;
+    C4 /4
+    D4 /4
+}
+melody();
+"#;
+        // Find byte offset inside the track body, after instrument assignment.
+        // "C4 /4" is well past "track.instrument = lead;" inside the body.
+        let c4_offset = source.find("C4 /4").unwrap();
+        let ctx = cursor_context(source, c4_offset).unwrap();
+        assert_eq!(ctx.track_name.as_deref(), Some("melody"));
+        assert_eq!(ctx.instrument.waveform, "square");
+    }
+
+    #[test]
+    fn test_cursor_context_after_tuning_change() {
+        let source = "track.tuningPitch = 432;\ntrack riff() { C3 /4 }\nriff();";
+        let ctx = cursor_context(source, 30).unwrap();
+        assert_eq!(ctx.tuning_pitch, 432.0);
+    }
+
+    #[test]
+    fn test_cursor_context_note_length_change() {
+        let source = r#"track riff() {
+    track.noteLength = 1/8;
+    C3
+}
+riff();
+"#;
+        // Cursor after the noteLength assignment inside the track body.
+        let c3_offset = source.find("C3").unwrap();
+        let ctx = cursor_context(source, c3_offset).unwrap();
+        assert_eq!(ctx.note_length, 0.125); // 1/8
     }
 }

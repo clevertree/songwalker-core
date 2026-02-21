@@ -12,13 +12,21 @@ use serde::{Deserialize, Serialize};
 /// contains one of these.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresetDescriptor {
+    /// Preset format identifier (e.g., "songwalker-preset"). Ignored during deser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Format version number. Ignored during deser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
     /// Unique identifier (e.g., "fluidr3-gm-acoustic-grand-piano").
+    #[serde(default)]
     pub id: String,
     /// Human-readable name (e.g., "Acoustic Grand Piano").
     pub name: String,
     /// Category of this preset.
     pub category: PresetCategory,
     /// Searchable tags (e.g., ["melodic", "piano", "gm:0"]).
+    #[serde(default)]
     pub tags: Vec<String>,
     /// Optional metadata about the preset's origin and classification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27,6 +35,8 @@ pub struct PresetDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuning: Option<TuningInfo>,
     /// The actual instrument/effect graph.
+    /// Accepts both "graph" and "node" in JSON for backwards compatibility.
+    #[serde(alias = "node")]
     pub graph: PresetNode,
 }
 
@@ -238,6 +248,7 @@ pub enum AudioCodec {
     Mp3,
     Ogg,
     Flac,
+    Raw,
 }
 
 // ── Effects ─────────────────────────────────────────────────
@@ -324,6 +335,48 @@ pub struct LibraryIndex {
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
     pub presets: Vec<CatalogEntry>,
+}
+
+// ── Root Index (songwalker-library/index.json) ──────────────
+
+/// An entry in the root library index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryEntry {
+    /// Type discriminator (usually "index")
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    /// Display name (e.g. "FluidR3 GM")
+    pub name: String,
+    /// Relative path (e.g. "FluidR3_GM/index.json")
+    pub path: String,
+    /// Human-readable summary
+    pub description: String,
+    /// Number of presets in this library
+    #[serde(rename = "presetCount")]
+    pub preset_count: usize,
+}
+
+impl LibraryEntry {
+    /// Extract the slug (directory name) from the path.
+    /// E.g. "FluidR3_GM/index.json" -> "FluidR3_GM"
+    pub fn slug(&self) -> String {
+        if let Some(idx) = self.path.find('/') {
+            self.path[..idx].to_string()
+        } else {
+            // Fallback: directory may be implied if path doesn't contain slashes
+            self.path.clone()
+        }
+    }
+}
+
+/// The root index.json structure (lists libraries).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootIndex {
+    pub format: String,
+    pub version: u32,
+    pub name: String,
+    pub description: String,
+    pub entries: Vec<LibraryEntry>,
 }
 
 // ── Playback Rate Calculations ──────────────────────────────
@@ -538,6 +591,8 @@ mod tests {
     #[test]
     fn preset_descriptor_roundtrip() {
         let preset = PresetDescriptor {
+            format: None,
+            version: None,
             id: "test-oscillator".to_string(),
             name: "Test Oscillator".to_string(),
             category: PresetCategory::Synth,
@@ -570,6 +625,8 @@ mod tests {
     #[test]
     fn sampler_preset_roundtrip() {
         let preset = PresetDescriptor {
+            format: None,
+            version: None,
             id: "test-piano".to_string(),
             name: "Test Piano".to_string(),
             category: PresetCategory::Sampler,
@@ -642,6 +699,8 @@ mod tests {
     #[test]
     fn composite_preset_roundtrip() {
         let preset = PresetDescriptor {
+            format: None,
+            version: None,
             id: "layered-test".to_string(),
             name: "Layered Test".to_string(),
             category: PresetCategory::Composite,

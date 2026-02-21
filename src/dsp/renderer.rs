@@ -61,6 +61,7 @@ mod tests {
         let song = EventList {
             events: vec![Event {
                 time: 0.0,
+                    track_name: None,
                 kind: EventKind::Note {
                     pitch: "C4".to_string(),
                     velocity: 100.0,

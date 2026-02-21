@@ -627,6 +627,7 @@ mod tests {
             events: vec![
                 Event {
                     time: 0.0,
+                    track_name: None,
                     kind: EventKind::SetProperty {
                         target: "track.beatsPerMinute".to_string(),
                         value: "120".to_string(),
@@ -634,6 +635,7 @@ mod tests {
                 },
                 Event {
                     time: 0.0,
+                    track_name: None,
                     kind: EventKind::Note {
                         pitch: "C4".to_string(),
                         velocity: 100.0,
@@ -645,6 +647,7 @@ mod tests {
                 },
                 Event {
                     time: 1.0,
+                    track_name: None,
                     kind: EventKind::Note {
                         pitch: "E4".to_string(),
                         velocity: 80.0,
@@ -755,6 +758,7 @@ mod tests {
             events: vec![
                 Event {
                     time: 0.0,
+                    track_name: None,
                     kind: EventKind::SetProperty {
                         target: "track.beatsPerMinute".to_string(),
                         value: "120".to_string(),
@@ -762,6 +766,7 @@ mod tests {
                 },
                 Event {
                     time: 0.0,
+                    track_name: None,
                     kind: EventKind::SetProperty {
                         target: "track.tuningPitch".to_string(),
                         value: "432".to_string(),
@@ -769,6 +774,7 @@ mod tests {
                 },
                 Event {
                     time: 0.0,
+                    track_name: None,
                     kind: EventKind::Note {
                         pitch: "A4".to_string(),
                         velocity: 100.0,
@@ -850,6 +856,7 @@ mod tests {
         let gate_song = EventList {
             events: vec![Event {
                 time: 0.0,
+                    track_name: None,
                 kind: EventKind::Note {
                     pitch: "A4".to_string(),
                     velocity: 100.0,
@@ -866,6 +873,7 @@ mod tests {
         let tail_song = EventList {
             events: vec![Event {
                 time: 0.0,
+                    track_name: None,
                 kind: EventKind::Note {
                     pitch: "A4".to_string(),
                     velocity: 100.0,
@@ -901,6 +909,7 @@ mod tests {
             events: vec![
                 Event {
                     time: 0.0,
+                    track_name: None,
                     kind: EventKind::SetProperty {
                         target: "track.beatsPerMinute".to_string(),
                         value: "120".to_string(),
@@ -908,6 +917,7 @@ mod tests {
                 },
                 Event {
                     time: 0.0,
+                    track_name: None,
                     kind: EventKind::Note {
                         pitch: "A4".to_string(),
                         velocity: 100.0,
@@ -972,6 +982,7 @@ mod tests {
             events: vec![
                 Event {
                     time: 0.0,
+                    track_name: None,
                     kind: EventKind::SetProperty {
                         target: "track.beatsPerMinute".to_string(),
                         value: "120".to_string(),
@@ -979,6 +990,7 @@ mod tests {
                 },
                 Event {
                     time: 0.0,
+                    track_name: None,
                     kind: EventKind::Note {
                         pitch: "A4".to_string(),
                         velocity: 100.0,
@@ -1012,6 +1024,7 @@ mod tests {
         let song = EventList {
             events: vec![Event {
                 time: 0.0,
+                    track_name: None,
                 kind: EventKind::Note {
                     pitch: "C4".to_string(),
                     velocity: 100.0,
@@ -1082,6 +1095,7 @@ mod tests {
         let song = EventList {
             events: vec![Event {
                 time: 0.0,
+                    track_name: None,
                 kind: EventKind::Note {
                     pitch: "A4".to_string(),
                     velocity: 100.0,
@@ -1138,6 +1152,7 @@ mod tests {
         let song = EventList {
             events: vec![Event {
                 time: 0.0,
+                    track_name: None,
                 kind: EventKind::Note {
                     pitch: "C4".to_string(),
                     velocity: 100.0,
@@ -1208,6 +1223,7 @@ mod tests {
         let song = EventList {
             events: vec![Event {
                 time: 0.0,
+                    track_name: None,
                 kind: EventKind::Note {
                     pitch: "C4".to_string(),
                     velocity: 100.0,

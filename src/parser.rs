@@ -175,6 +175,7 @@ impl Parser {
     // ── Track Definition ────────────────────────────────────
 
     fn parse_track_def(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.span().start;
         self.expect(&Token::Track)?;
         let name = self.expect_ident()?;
         self.expect(&Token::LParen)?;
@@ -183,7 +184,8 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let body = self.parse_track_body()?;
         self.expect(&Token::RBrace)?;
-        Ok(Statement::TrackDef { name, params, body })
+        let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
+        Ok(Statement::TrackDef { name, params, body, span_start: start_span, span_end: end_span })
     }
 
     fn parse_param_list(&mut self) -> Result<Vec<String>, ParseError> {
@@ -228,8 +230,10 @@ impl Parser {
             Token::LBracket => self.parse_chord(),
             Token::Number(_) => {
                 // Standalone number = rest
+                let start_span = self.span().start;
                 let dur = self.parse_duration_expr()?;
-                Ok(TrackStatement::Rest(dur))
+                let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
+                Ok(TrackStatement::Rest { duration: dur, span_start: start_span, span_end: end_span })
             }
             Token::Track => {
                 // `track.property = value`
@@ -239,8 +243,10 @@ impl Parser {
             Token::Ident(_) => self.parse_ident_statement_in_track(),
             Token::Dot => {
                 // Dot shorthand as a rest: `.` or `..`
+                let start_span = self.span().start;
                 let dur = self.parse_duration_expr()?;
-                Ok(TrackStatement::Rest(dur))
+                let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
+                Ok(TrackStatement::Rest { duration: dur, span_start: start_span, span_end: end_span })
             }
             _ => Err(ParseError::UnexpectedToken {
                 expected: "track statement (note, chord, rest, assignment, or for loop)".into(),
@@ -253,23 +259,26 @@ impl Parser {
     // ── Ident-leading statement (note event or track call) ──
 
     fn parse_ident_statement(&mut self, _in_track: bool) -> Result<Statement, ParseError> {
+        let start_span = self.span().start;
         let name = self.expect_ident()?;
 
         // Check for assignment: `name.prop = value` or `name = value`
         if self.check(&Token::Dot) {
-            // Could be `track.prop = value` — but `track` would be a keyword.
-            // For other identifiers like `x.y = z`:
             let target = self.parse_dotted_ident_rest(name)?;
             self.expect(&Token::Eq)?;
             let value = self.parse_expr()?;
-            return Ok(Statement::Assignment { target, value });
+            let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
+            return Ok(Statement::Assignment { target, value, span_start: start_span, span_end: end_span });
         }
         if self.check(&Token::Eq) {
             self.advance();
             let value = self.parse_expr()?;
+            let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
             return Ok(Statement::Assignment {
                 target: name,
                 value,
+                span_start: start_span,
+                span_end: end_span,
             });
         }
 
@@ -282,12 +291,15 @@ impl Parser {
             let args = self.parse_call_args()?;
             self.expect(&Token::RParen)?;
             let step = self.try_parse_duration()?;
+            let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
             Ok(Statement::TrackCall {
                 name,
                 velocity,
                 play_duration,
                 args,
                 step,
+                span_start: start_span,
+                span_end: end_span,
             })
         } else {
             Err(ParseError::UnexpectedToken {
@@ -309,14 +321,18 @@ impl Parser {
             let target = self.parse_dotted_ident_rest(name)?;
             self.expect(&Token::Eq)?;
             let value = self.parse_expr()?;
-            return Ok(TrackStatement::Assignment { target, value });
+            let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
+            return Ok(TrackStatement::Assignment { target, value, span_start: start_span, span_end: end_span });
         }
         if self.check(&Token::Eq) {
             self.advance();
             let value = self.parse_expr()?;
+            let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
             return Ok(TrackStatement::Assignment {
                 target: name,
                 value,
+                span_start: start_span,
+                span_end: end_span,
             });
         }
 
@@ -329,12 +345,15 @@ impl Parser {
             let args = self.parse_call_args()?;
             self.expect(&Token::RParen)?;
             let step = self.try_parse_duration()?;
+            let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
             Ok(TrackStatement::TrackCall {
                 name,
                 velocity,
                 play_duration,
                 args,
                 step,
+                span_start: start_span,
+                span_end: end_span,
             })
         } else {
             // Note event: pitch was `name`, parse optional step duration
@@ -364,29 +383,35 @@ impl Parser {
     // ── Assignment starting with `track` keyword ────────────
 
     fn parse_assignment_starting_with_track(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.span().start;
         self.expect(&Token::Track)?; // consume `track`
         let target = self.parse_dotted_ident_rest("track".to_string())?;
         self.expect(&Token::Eq)?;
         let value = self.parse_expr()?;
-        Ok(Statement::Assignment { target, value })
+        let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
+        Ok(Statement::Assignment { target, value, span_start: start_span, span_end: end_span })
     }
 
     fn parse_track_body_assignment(&mut self) -> Result<TrackStatement, ParseError> {
+        let start_span = self.span().start;
         self.expect(&Token::Track)?;
         let target = self.parse_dotted_ident_rest("track".to_string())?;
         self.expect(&Token::Eq)?;
         let value = self.parse_expr()?;
-        Ok(TrackStatement::Assignment { target, value })
+        let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
+        Ok(TrackStatement::Assignment { target, value, span_start: start_span, span_end: end_span })
     }
 
     // ── Const Declaration ───────────────────────────────────
 
     fn parse_const_decl(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.span().start;
         self.expect(&Token::Const)?;
         let name = self.expect_ident()?;
         self.expect(&Token::Eq)?;
         let value = self.parse_expr()?;
-        Ok(Statement::ConstDecl { name, value })
+        let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
+        Ok(Statement::ConstDecl { name, value, span_start: start_span, span_end: end_span })
     }
 
     // ── Chord ───────────────────────────────────────────────
@@ -434,6 +459,7 @@ impl Parser {
     // ── For Loop ────────────────────────────────────────────
 
     fn parse_for_loop(&mut self) -> Result<TrackStatement, ParseError> {
+        let start_span = self.span().start;
         self.expect(&Token::For)?;
         self.expect(&Token::LParen)?;
 
@@ -449,12 +475,15 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let body = self.parse_track_body()?;
         self.expect(&Token::RBrace)?;
+        let end_span = self.tokens[self.pos.saturating_sub(1)].span.end;
 
         Ok(TrackStatement::ForLoop {
             init,
             condition,
             update,
             body,
+            span_start: start_span,
+            span_end: end_span,
         })
     }
 
@@ -713,7 +742,7 @@ track riff(inst) {
 
         assert_eq!(program.statements.len(), 1);
         match &program.statements[0] {
-            Statement::TrackDef { name, params, body } => {
+            Statement::TrackDef { name, params, body, .. } => {
                 assert_eq!(name, "riff");
                 assert_eq!(params, &["inst"]);
                 // Filter out comments
@@ -780,6 +809,7 @@ track t() {
                 play_duration,
                 args,
                 step,
+                ..
             } => {
                 assert_eq!(name, "drums");
                 assert_eq!(*velocity, Some(96.0));
@@ -795,7 +825,7 @@ track t() {
     fn test_parse_const_decl() {
         let program = parse(r#"const lead = loadPreset("Guitar");"#).unwrap();
         match &program.statements[0] {
-            Statement::ConstDecl { name, value } => {
+            Statement::ConstDecl { name, value, .. } => {
                 assert_eq!(name, "lead");
                 match value {
                     Expr::FunctionCall { function, args } => {
@@ -813,7 +843,7 @@ track t() {
     fn test_parse_assignment() {
         let program = parse("track.beatsPerMinute = 160;").unwrap();
         match &program.statements[0] {
-            Statement::Assignment { target, value } => {
+            Statement::Assignment { target, value, .. } => {
                 assert_eq!(target, "track.beatsPerMinute");
                 match value {
                     Expr::Number(n) => assert_eq!(*n, 160.0),
@@ -873,7 +903,7 @@ track t() {
         match &program.statements[0] {
             Statement::TrackDef { body, .. } => {
                 assert!(matches!(&body[0], TrackStatement::NoteEvent { pitch, .. } if pitch == "C3"));
-                assert!(matches!(&body[1], TrackStatement::Rest(DurationExpr::Beats(n)) if *n == 4.0));
+                assert!(matches!(&body[1], TrackStatement::Rest { duration: DurationExpr::Beats(n), .. } if *n == 4.0));
                 assert!(matches!(&body[2], TrackStatement::NoteEvent { pitch, .. } if pitch == "D3"));
             }
             other => panic!("Expected TrackDef, got {other:?}"),
@@ -901,6 +931,7 @@ track t() {
                     condition,
                     update,
                     body,
+                    ..
                 } => {
                     assert!(init.contains("let"));
                     assert!(condition.contains("<"));
@@ -930,7 +961,7 @@ track t() {
 
         match &program.statements[0] {
             Statement::TrackDef { body, .. } => match &body[0] {
-                TrackStatement::Assignment { target, value } => {
+                TrackStatement::Assignment { target, value, .. } => {
                     assert_eq!(target, "track.duration");
                     match value {
                         Expr::DurationLit(DurationExpr::Fraction(n, m)) => {
